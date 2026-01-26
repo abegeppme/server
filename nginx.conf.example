@@ -1,0 +1,42 @@
+# Nginx Configuration Example for AbegEppMe API
+# Place this in your Nginx server block
+
+server {
+    listen 80;
+    server_name api.abegeppme.com;  # Change to your domain
+    root /path/to/abegeppme-v4/server;
+    index index.php;
+
+    # API routes
+    location /api {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    # PHP processing
+    location ~ \.php$ {
+        fastcgi_pass unix:/var/run/php/php7.4-fpm.sock;  # Adjust PHP version
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    # CORS headers
+    add_header Access-Control-Allow-Origin $http_origin always;
+    add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+    add_header Access-Control-Allow-Credentials "true" always;
+
+    # Handle preflight requests
+    if ($request_method = OPTIONS) {
+        return 204;
+    }
+
+    # Security
+    location ~ /\. {
+        deny all;
+    }
+
+    location ~ \.(env|log|sql)$ {
+        deny all;
+    }
+}

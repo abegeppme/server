@@ -1,0 +1,571 @@
+// Prisma Schema for AbegEppMe Service Marketplace
+// Database: PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// USER MANAGEMENT
+// ============================================
+
+enum UserRole {
+  CUSTOMER
+  VENDOR
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING_VERIFICATION
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String?
+  password  String   // Hashed password
+  role      UserRole @default(CUSTOMER)
+  status    UserStatus @default(PENDING_VERIFICATION)
+  
+  // Profile information
+  phone     String?
+  avatar    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  services          Service[]
+  ordersAsCustomer  Order[] @relation("CustomerOrders")
+  ordersAsVendor    Order[] @relation("VendorOrders")
+  conversationsAsUser1 Conversation[] @relation("User1Conversations")
+  conversationsAsUser2 Conversation[] @relation("User2Conversations")
+  messages          Message[]
+  disputesAsCustomer Dispute[] @relation("CustomerDisputes")
+  disputesAsVendor   Dispute[] @relation("VendorDisputes")
+  notifications     Notification[]
+  subaccount        Subaccount?
+  transactionLogs   TransactionLog[]
+  suspiciousActivity SuspiciousActivity[]
+
+  @@index([email])
+  @@index([role])
+  @@index([status])
+  @@map("users")
+}
+
+// ============================================
+// SERVICE PROVIDER / VENDOR
+// ============================================
+
+model Subaccount {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  subaccountCode  String   @unique // Paystack subaccount code
+  accountNumber   String?
+  accountName     String?
+  bankCode        String?
+  transferRecipient String? // Paystack transfer recipient code
+  
+  status          String   @default("active") // active, inactive
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([userId])
+  @@index([subaccountCode])
+  @@map("subaccounts")
+}
+
+// ============================================
+// SERVICES
+// ============================================
+
+enum ServiceStatus {
+  DRAFT
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+model Service {
+  id          String        @id @default(uuid())
+  vendorId    String
+  vendor      User          @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  
+  title       String
+  description String?       @db.Text
+  price       Decimal       @db.Decimal(10, 2)
+  category    String?
+  
+  // Media
+  images      String[]      // Array of image URLs
+  gallery     String[]      // Additional gallery images
+  
+  // Status
+  status      ServiceStatus @default(DRAFT)
+  
+  // Metadata
+  featured    Boolean       @default(false)
+  rating      Decimal?      @db.Decimal(3, 2)
+  reviewCount Int           @default(0)
+  
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  // Relations
+  orderItems  OrderItem[]
+
+  @@index([vendorId])
+  @@index([status])
+  @@index([category])
+  @@index([featured])
+  @@map("services")
+}
+
+// ============================================
+// ORDERS
+// ============================================
+
+enum OrderStatus {
+  PENDING
+  PROCESSING
+  IN_SERVICE
+  AWAITING_CONFIRMATION
+  COMPLETED
+  CANCELLED
+  REFUNDED
+  IN_DISPUTE
+}
+
+model Order {
+  id          String      @id @default(uuid())
+  orderNumber String      @unique // Human-readable order number
+  
+  customerId  String
+  customer    User        @relation("CustomerOrders", fields: [customerId], references: [id], onDelete: Cascade)
+  
+  vendorId    String
+  vendor      User        @relation("VendorOrders", fields: [vendorId], references: [id], onDelete: Cascade)
+  
+  // Order totals
+  subtotal    Decimal     @db.Decimal(10, 2)
+  serviceCharge Decimal   @db.Decimal(10, 2)
+  vatAmount   Decimal     @db.Decimal(10, 2)
+  total       Decimal     @db.Decimal(10, 2)
+  
+  // Status
+  status      OrderStatus @default(PENDING)
+  
+  // Service completion
+  vendorComplete      Boolean   @default(false)
+  customerConfirmed   Boolean   @default(false)
+  completionDocuments String[]  // Array of document URLs
+  
+  // Payment method (locked at checkout)
+  paymentMethodType   String?    // 'split' or 'individual'
+  paymentMethodSetAt  DateTime?
+  
+  // Timestamps
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  completedAt DateTime?
+
+  // Relations
+  items        OrderItem[]
+  payment      Payment?
+  paymentBreakdown PaymentBreakdown?
+  dispute      Dispute?
+  transfers    Transfer[]
+
+  @@index([customerId])
+  @@index([vendorId])
+  @@index([status])
+  @@index([orderNumber])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String   @id @default(uuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  
+  serviceId String
+  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  
+  quantity  Int      @default(1)
+  price     Decimal  @db.Decimal(10, 2)
+  
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([serviceId])
+  @@map("order_items")
+}
+
+// ============================================
+// PAYMENTS
+// ============================================
+
+enum PaymentStatus {
+  PENDING
+  INITIALIZED
+  PAID
+  FAILED
+  REFUNDED
+}
+
+model Payment {
+  id              String        @id @default(uuid())
+  orderId         String        @unique
+  order           Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  
+  // Paystack references
+  paystackRef     String        @unique // Paystack transaction reference
+  paystackAuthUrl String?
+  
+  // Amounts
+  amount          Decimal       @db.Decimal(10, 2) // Total in kobo (stored as decimal)
+  currency        String        @default("NGN")
+  
+  // Status
+  status          PaymentStatus @default(PENDING)
+  
+  // Metadata
+  customerEmail   String
+  customerName    String?
+  vendorEmail     String?
+  vendorName      String?
+  
+  // Timestamps
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  paidAt          DateTime?
+
+  @@index([orderId])
+  @@index([paystackRef])
+  @@index([status])
+  @@map("payments")
+}
+
+model PaymentBreakdown {
+  id                    String   @id @default(uuid())
+  orderId               String   @unique
+  order                 Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  
+  // Amounts (in kobo, stored as decimal)
+  total                 Decimal   @db.Decimal(10, 2)
+  subtotal              Decimal   @db.Decimal(10, 2)
+  serviceCharge         Decimal   @db.Decimal(10, 2)
+  vatAmount             Decimal   @db.Decimal(10, 2)
+  
+  // Percentages
+  vendorInitialPct      Decimal   @db.Decimal(5, 2)
+  insurancePct          Decimal   @db.Decimal(5, 2)
+  commissionPct         Decimal   @db.Decimal(5, 2)
+  vatPct                Decimal   @db.Decimal(5, 2)
+  
+  // Calculated amounts (in kobo)
+  vendorInitialAmount   Decimal   @db.Decimal(10, 2)
+  insuranceAmount       Decimal   @db.Decimal(10, 2)
+  commissionAmount      Decimal   @db.Decimal(10, 2)
+  vendorBalanceAmount   Decimal   @db.Decimal(10, 2) // Escrow balance
+  
+  // Payment method
+  paymentMethodType     String    // 'split' or 'individual'
+  
+  // Payment status flags
+  vendorInitialPaid     Boolean   @default(false)
+  insurancePaid         Boolean   @default(false)
+  balancePaid           Boolean   @default(false)
+  
+  // Individual payment method specific
+  individualTransfersProcessed Boolean @default(false)
+  individualTransferMethod     String? // 'single' or 'bulk'
+  individualTransferRefs        Json?   // Store transfer references
+  
+  // Insurance subaccount
+  insuranceSubaccount   String?
+  
+  // Snapshot data (JSON for flexibility)
+  snapshot              Json?     // Complete breakdown snapshot
+  
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([orderId])
+  @@map("payment_breakdowns")
+}
+
+// ============================================
+// TRANSFERS
+// ============================================
+
+enum TransferStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+}
+
+enum TransferType {
+  VENDOR_INITIAL
+  INSURANCE
+  VENDOR_BALANCE
+  REFUND
+}
+
+model Transfer {
+  id              String        @id @default(uuid())
+  orderId         String
+  order           Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  
+  // Transfer details
+  type            TransferType
+  amount          Decimal       @db.Decimal(10, 2) // in kobo
+  recipient       String        // Paystack recipient code or subaccount
+  
+  // Paystack references
+  paystackRef     String?       @unique // Paystack transfer reference
+  paystackResponse Json?        // Full Paystack response
+  
+  // Status
+  status          TransferStatus @default(PENDING)
+  
+  // Metadata
+  reason          String?
+  failureReason   String?
+  
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  processedAt     DateTime?
+
+  @@index([orderId])
+  @@index([paystackRef])
+  @@index([status])
+  @@index([type])
+  @@map("transfers")
+}
+
+// ============================================
+// CHAT / MESSAGING
+// ============================================
+
+model Conversation {
+  id        String   @id @default(uuid())
+  
+  user1Id  String
+  user1    User      @relation("User1Conversations", fields: [user1Id], references: [id], onDelete: Cascade)
+  
+  user2Id  String
+  user2    User      @relation("User2Conversations", fields: [user2Id], references: [id], onDelete: Cascade)
+  
+  // Metadata
+  lastMessageAt DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  messages      Message[]
+
+  @@unique([user1Id, user2Id])
+  @@index([user1Id])
+  @@index([user2Id])
+  @@index([lastMessageAt])
+  @@map("conversations")
+}
+
+enum MessageKind {
+  MESSAGE
+  PHOTO
+  FILE
+}
+
+model Message {
+  id             String        @id @default(uuid())
+  conversationId String
+  conversation   Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  
+  fromId         String
+  from           User          @relation(fields: [fromId], references: [id], onDelete: Cascade)
+  
+  kind           MessageKind   @default(MESSAGE)
+  content        String        @db.Text
+  fileUrl        String?       // For photo/file messages
+  
+  // Delivery status
+  delivered      Boolean       @default(false)
+  read           Boolean       @default(false)
+  
+  createdAt      DateTime      @default(now())
+
+  @@index([conversationId])
+  @@index([fromId])
+  @@index([createdAt])
+  @@map("messages")
+}
+
+// ============================================
+// DISPUTES
+// ============================================
+
+enum DisputeStatus {
+  PENDING
+  UNDER_REVIEW
+  RESOLVED
+  DISMISSED
+}
+
+enum DisputeResolution {
+  REFUND_CUSTOMER
+  PAY_VENDOR
+  PARTIAL_SETTLEMENT
+  NO_ACTION
+}
+
+model Dispute {
+  id              String            @id @default(uuid())
+  orderId         String            @unique
+  order           Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  
+  customerId      String
+  customer        User              @relation("CustomerDisputes", fields: [customerId], references: [id], onDelete: Cascade)
+  
+  vendorId        String
+  vendor          User              @relation("VendorDisputes", fields: [vendorId], references: [id], onDelete: Cascade)
+  
+  // Dispute details
+  reason          String            @db.Text
+  description     String?           @db.Text
+  evidence        String[]          // Array of evidence URLs
+  
+  // Status
+  status          DisputeStatus      @default(PENDING)
+  resolution      DisputeResolution?
+  
+  // Resolution details
+  resolutionNote String?            @db.Text
+  resolvedBy      String?           // Admin user ID
+  resolvedAt      DateTime?
+  
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([orderId])
+  @@index([customerId])
+  @@index([vendorId])
+  @@index([status])
+  @@map("disputes")
+}
+
+// ============================================
+// NOTIFICATIONS
+// ============================================
+
+enum NotificationType {
+  ORDER_CREATED
+  ORDER_UPDATED
+  PAYMENT_RECEIVED
+  SERVICE_COMPLETE
+  DISPUTE_RAISED
+  DISPUTE_RESOLVED
+  MESSAGE_RECEIVED
+  TRANSFER_SUCCESS
+  TRANSFER_FAILED
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  type      NotificationType
+  title     String
+  message   String           @db.Text
+  data      Json?            // Additional data
+  
+  read      Boolean          @default(false)
+  
+  createdAt DateTime         @default(now())
+
+  @@index([userId])
+  @@index([read])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+// ============================================
+// TRANSACTION LOGS
+// ============================================
+
+model TransactionLog {
+  id              String   @id @default(uuid())
+  orderId         String?
+  userId          String?
+  user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  
+  transactionRef  String? // Paystack or other transaction reference
+  eventType       String   // 'payment_success', 'transfer_initiated', etc.
+  
+  requestPayload  Json?    // Request data
+  responsePayload  Json?    // Response data
+  
+  createdAt       DateTime @default(now())
+
+  @@index([orderId])
+  @@index([userId])
+  @@index([transactionRef])
+  @@index([eventType])
+  @@index([createdAt])
+  @@map("transaction_logs")
+}
+
+// ============================================
+// SECURITY & MONITORING
+// ============================================
+
+enum SuspiciousActivityReason {
+  MULTIPLE_TRANSACTIONS
+  EXCESSIVE_CANCELLATIONS
+  UNUSUAL_PATTERNS
+}
+
+enum SuspiciousActivityStatus {
+  PENDING_REVIEW
+  REVIEWED
+  DISMISSED
+}
+
+model SuspiciousActivity {
+  id        String                    @id @default(uuid())
+  customerId String?
+  customer  User?                      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  
+  vendorId   String?
+  vendor     User?                     @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  
+  reason     SuspiciousActivityReason
+  count      Int                       @default(1)
+  details    Json?                     // Additional details
+  
+  status     SuspiciousActivityStatus  @default(PENDING_REVIEW)
+  
+  createdAt  DateTime                  @default(now())
+  reviewedAt DateTime?
+  reviewedBy String?                  // Admin user ID
+
+  @@index([customerId])
+  @@index([vendorId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("suspicious_activity")
+}
