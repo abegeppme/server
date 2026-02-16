@@ -23,10 +23,53 @@ class PaymentController extends BaseController {
         $this->emailService = new EmailService();
         $this->notificationService = new NotificationService();
     }
+
+    public function handleRequest($method, $id = null, $sub_resource = null) {
+        if ($method === 'POST' && $id === 'initialize') {
+            $data = $this->getRequestBody();
+            $this->initializePayment($data);
+            return;
+        }
+
+        if ($method === 'GET' && $id === 'verify' && !empty($sub_resource)) {
+            $this->verifyPaymentByReference($sub_resource);
+            return;
+        }
+
+        if ($method === 'GET' && $id === 'banks') {
+            $this->getBanks();
+            return;
+        }
+
+        if ($method === 'POST' && $id === 'resolve-account') {
+            $this->resolveBankAccount();
+            return;
+        }
+
+        if ($id === 'bank-details' && $method === 'GET') {
+            $this->getUserBankDetails();
+            return;
+        }
+
+        if ($id === 'bank-details' && $method === 'POST') {
+            $this->saveUserBankDetails();
+            return;
+        }
+
+        parent::handleRequest($method, $id, $sub_resource);
+    }
     
     public function create() {
         $data = $this->getRequestBody();
         $action = $data['action'] ?? null;
+
+        // Support path-based style: POST /api/payments/initialize
+        if ($action === null) {
+            $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?: '';
+            if (substr($requestPath, -11) === '/initialize') {
+                $action = 'initialize';
+            }
+        }
         
         switch ($action) {
             case 'initialize':
@@ -236,6 +279,32 @@ class PaymentController extends BaseController {
             $this->sendError('Payment verification failed: ' . $e->getMessage(), 500);
         }
     }
+
+    private function verifyPaymentByReference($reference) {
+        if (empty($reference)) {
+            $this->sendError('Reference is required', 400);
+        }
+
+        $paymentStmt = $this->db->prepare("
+            SELECT p.*, o.id as order_id, o.country_id, c.payment_gateway, c.payment_gateway_config
+            FROM payments p
+            INNER JOIN orders o ON p.order_id = o.id
+            INNER JOIN countries c ON o.country_id = c.id
+            WHERE p.paystack_ref = ?
+            LIMIT 1
+        ");
+        $paymentStmt->execute([$reference]);
+        $payment = $paymentStmt->fetch();
+
+        if (!$payment) {
+            $this->sendError('Payment not found', 404);
+        }
+
+        $this->verifyPayment([
+            'reference' => $reference,
+            'order_id' => $payment['order_id'],
+        ]);
+    }
     
     public function postWebhooks($provider) {
         $payload = file_get_contents('php://input');
@@ -390,5 +459,387 @@ class PaymentController extends BaseController {
                 $updateStmt->execute([json_encode($transferRefs), $payment['order_id']]);
             }
         }
+    }
+
+    private function getBanks() {
+        $user = $this->auth->requireAuth();
+        $countryId = $_GET['country_id'] ?? $user['country_id'] ?? 'NG';
+        $country = $this->countryManager->getCountry($countryId);
+        if (!$country) {
+            $this->sendError('Country not found', 404);
+        }
+
+        $gatewayName = strtolower($country['payment_gateway'] ?? '');
+        $config = json_decode($country['payment_gateway_config'] ?? '{}', true) ?: [];
+
+        if ($gatewayName === 'paystack') {
+            $response = $this->gatewayRequest($gatewayName, $config, 'GET', '/bank?country=' . strtolower($countryId));
+            $banks = array_map(function ($item) {
+                return [
+                    'code' => (string)($item['code'] ?? ''),
+                    'name' => (string)($item['name'] ?? ''),
+                ];
+            }, $response['data'] ?? []);
+
+            $this->sendResponse([
+                'country_id' => $countryId,
+                'gateway' => 'paystack',
+                'banks' => array_values(array_filter($banks, function ($bank) {
+                    return $bank['code'] !== '' && $bank['name'] !== '';
+                })),
+            ]);
+        }
+
+        if ($gatewayName === 'flutterwave') {
+            $response = $this->gatewayRequest($gatewayName, $config, 'GET', '/banks/' . strtoupper($countryId));
+            $banks = array_map(function ($item) {
+                return [
+                    'code' => (string)($item['code'] ?? ''),
+                    'name' => (string)($item['name'] ?? ''),
+                ];
+            }, $response['data'] ?? []);
+
+            $this->sendResponse([
+                'country_id' => $countryId,
+                'gateway' => 'flutterwave',
+                'banks' => array_values(array_filter($banks, function ($bank) {
+                    return $bank['code'] !== '' && $bank['name'] !== '';
+                })),
+            ]);
+        }
+
+        $this->sendResponse([
+            'country_id' => $countryId,
+            'gateway' => $gatewayName,
+            'banks' => [],
+        ]);
+    }
+
+    private function resolveBankAccount() {
+        $user = $this->auth->requireAuth();
+        $data = $this->getRequestBody();
+        $countryId = $data['country_id'] ?? $user['country_id'] ?? 'NG';
+        $bankCode = trim($data['bank_code'] ?? '');
+        $accountNumber = preg_replace('/\D+/', '', $data['account_number'] ?? '');
+
+        if ($bankCode === '' || $accountNumber === '') {
+            $this->sendError('bank_code and account_number are required', 400);
+        }
+
+        if (strtoupper($countryId) === 'NG' && strlen($accountNumber) !== 10) {
+            $this->sendError('Nigerian account number must be exactly 10 digits', 400);
+        }
+
+        $country = $this->countryManager->getCountry($countryId);
+        if (!$country) {
+            $this->sendError('Country not found', 404);
+        }
+
+        $gatewayName = strtolower($country['payment_gateway'] ?? '');
+        $config = json_decode($country['payment_gateway_config'] ?? '{}', true) ?: [];
+
+        if ($gatewayName === 'paystack') {
+            $query = '/bank/resolve?account_number=' . urlencode($accountNumber) . '&bank_code=' . urlencode($bankCode);
+            $response = $this->gatewayRequest($gatewayName, $config, 'GET', $query);
+            $data = $response['data'] ?? [];
+            $this->sendResponse([
+                'account_name' => $data['account_name'] ?? '',
+                'account_number' => $data['account_number'] ?? $accountNumber,
+                'bank_code' => $bankCode,
+                'bank_name' => $data['bank_name'] ?? null,
+            ]);
+        }
+
+        if ($gatewayName === 'flutterwave') {
+            $response = $this->gatewayRequest($gatewayName, $config, 'POST', '/accounts/resolve', [
+                'account_number' => $accountNumber,
+                'account_bank' => $bankCode,
+            ]);
+            $data = $response['data'] ?? [];
+            $this->sendResponse([
+                'account_name' => $data['account_name'] ?? '',
+                'account_number' => $data['account_number'] ?? $accountNumber,
+                'bank_code' => $bankCode,
+                'bank_name' => $data['bank_name'] ?? null,
+            ]);
+        }
+
+        $this->sendError('Bank account resolution not configured for this country/gateway', 400);
+    }
+
+    private function getUserBankDetails() {
+        $user = $this->auth->requireAuth();
+        $countryId = $_GET['country_id'] ?? $user['country_id'] ?? 'NG';
+        $hasVerifiedAt = $this->checkColumnExists('subaccounts', 'account_verified_at');
+
+        $hasCountryId = $this->checkColumnExists('subaccounts', 'country_id');
+        $query = $hasCountryId
+            ? "SELECT * FROM subaccounts WHERE user_id = ? AND country_id = ? LIMIT 1"
+            : "SELECT * FROM subaccounts WHERE user_id = ? LIMIT 1";
+
+        $stmt = $this->db->prepare($query);
+        $params = $hasCountryId ? [$user['id'], $countryId] : [$user['id']];
+        $stmt->execute($params);
+        $record = $stmt->fetch();
+
+        if ($record) {
+            $accountNumber = (string)($record['account_number'] ?? '');
+            $record['masked_account_number'] = $accountNumber !== '' ? ('****' . substr($accountNumber, -4)) : null;
+            $record['is_verified'] = !empty($record['subaccount_code']) && !empty($record['account_name']) && (($record['status'] ?? 'active') !== 'inactive');
+            $record['verified_at'] = $hasVerifiedAt ? ($record['account_verified_at'] ?? $record['updated_at']) : ($record['updated_at'] ?? null);
+        }
+
+        $this->sendResponse([
+            'country_id' => $countryId,
+            'has_details' => !!$record,
+            'details' => $record ?: null,
+        ]);
+    }
+
+    private function saveUserBankDetails() {
+        $user = $this->auth->requireAuth();
+        $data = $this->getRequestBody();
+        $countryId = strtoupper($data['country_id'] ?? $user['country_id'] ?? 'NG');
+        $bankCode = trim($data['bank_code'] ?? '');
+        $accountNumber = preg_replace('/\D+/', '', $data['account_number'] ?? '');
+
+        if ($bankCode === '' || $accountNumber === '') {
+            $this->sendError('bank_code and account_number are required', 400);
+        }
+
+        $country = $this->countryManager->getCountry($countryId);
+        if (!$country) {
+            $this->sendError('Country not found', 404);
+        }
+
+        $gatewayName = strtolower($country['payment_gateway'] ?? '');
+        $config = json_decode($country['payment_gateway_config'] ?? '{}', true) ?: [];
+
+        // Resolve account name first for safety.
+        $resolved = $this->resolveAccountNameInternal($gatewayName, $config, $bankCode, $accountNumber, $countryId);
+        $accountName = $resolved['account_name'] ?? '';
+        $bankName = $resolved['bank_name'] ?? null;
+        if ($accountName === '') {
+            $this->sendError('Unable to resolve account name for this bank/account combination', 400);
+        }
+
+        $subaccountCode = null;
+        $transferRecipient = null;
+
+        if ($gatewayName === 'paystack') {
+            $subRes = $this->gatewayRequest('paystack', $config, 'POST', '/subaccount', [
+                'business_name' => $user['name'] ?: $user['email'],
+                'settlement_bank' => $bankCode,
+                'account_number' => $accountNumber,
+                'percentage_charge' => 0,
+                'description' => 'Vendor payout account',
+                'primary_contact_email' => $user['email'],
+                'primary_contact_name' => $user['name'] ?: $user['email'],
+            ]);
+            $subData = $subRes['data'] ?? [];
+            $subaccountCode = $subData['subaccount_code'] ?? null;
+
+            try {
+                $recipientRes = $this->gatewayRequest('paystack', $config, 'POST', '/transferrecipient', [
+                    'type' => 'nuban',
+                    'name' => $accountName,
+                    'account_number' => $accountNumber,
+                    'bank_code' => $bankCode,
+                    'currency' => $country['currency_code'] ?? 'NGN',
+                ]);
+                $transferRecipient = $recipientRes['data']['recipient_code'] ?? null;
+            } catch (Exception $e) {
+                // Recipient is optional for now; do not block saving if subaccount exists.
+                $transferRecipient = null;
+            }
+
+            if (!$subaccountCode) {
+                $this->sendError('Failed to create Paystack subaccount', 500);
+            }
+        } elseif ($gatewayName === 'flutterwave') {
+            $recipient = PaymentGatewayFactory::create($gatewayName, $config)->createRecipient([
+                'account_number' => $accountNumber,
+                'bank_code' => $bankCode,
+                'currency' => $country['currency_code'] ?? 'NGN',
+            ]);
+            $transferRecipient = $recipient['recipient_code'] ?? null;
+            $subaccountCode = $transferRecipient ?: ('flw_' . $bankCode . '_' . $accountNumber);
+        } else {
+            $subaccountCode = 'manual_' . $bankCode . '_' . $accountNumber;
+        }
+
+        $hasCountryId = $this->checkColumnExists('subaccounts', 'country_id');
+        $hasBankName = $this->checkColumnExists('subaccounts', 'bank_name');
+        $existingQuery = $hasCountryId
+            ? "SELECT id FROM subaccounts WHERE user_id = ? AND country_id = ? LIMIT 1"
+            : "SELECT id FROM subaccounts WHERE user_id = ? LIMIT 1";
+        $existingStmt = $this->db->prepare($existingQuery);
+        $existingParams = $hasCountryId ? [$user['id'], $countryId] : [$user['id']];
+        $existingStmt->execute($existingParams);
+        $existing = $existingStmt->fetch();
+
+        if ($existing) {
+            $updateColumns = [
+                'subaccount_code = ?',
+                'account_number = ?',
+                'account_name = ?',
+                'bank_code = ?',
+                'transfer_recipient = ?',
+                'status = ?',
+                'updated_at = NOW()',
+            ];
+            $updateParams = [
+                $subaccountCode,
+                $accountNumber,
+                $accountName,
+                $bankCode,
+                $transferRecipient,
+                'active',
+            ];
+            if ($hasBankName) {
+                $updateColumns[] = 'bank_name = ?';
+                $updateParams[] = $bankName;
+            }
+            if ($this->checkColumnExists('subaccounts', 'account_verified_at')) {
+                $updateColumns[] = 'account_verified_at = NOW()';
+            }
+            if ($hasCountryId) {
+                $updateColumns[] = 'country_id = ?';
+                $updateParams[] = $countryId;
+            }
+            $updateParams[] = $existing['id'];
+            $stmt = $this->db->prepare("UPDATE subaccounts SET " . implode(', ', $updateColumns) . " WHERE id = ?");
+            $stmt->execute($updateParams);
+            $recordId = $existing['id'];
+        } else {
+            $columns = ['id', 'user_id', 'subaccount_code', 'account_number', 'account_name', 'bank_code', 'transfer_recipient', 'status'];
+            $placeholders = ['?', '?', '?', '?', '?', '?', '?', '?'];
+            $insertParams = [
+                $this->generateUUID(),
+                $user['id'],
+                $subaccountCode,
+                $accountNumber,
+                $accountName,
+                $bankCode,
+                $transferRecipient,
+                'active',
+            ];
+            if ($hasCountryId) {
+                $columns[] = 'country_id';
+                $placeholders[] = '?';
+                $insertParams[] = $countryId;
+            }
+            if ($hasBankName) {
+                $columns[] = 'bank_name';
+                $placeholders[] = '?';
+                $insertParams[] = $bankName;
+            }
+            if ($this->checkColumnExists('subaccounts', 'account_verified_at')) {
+                $columns[] = 'account_verified_at';
+                $placeholders[] = 'NOW()';
+            }
+            $stmt = $this->db->prepare("INSERT INTO subaccounts (" . implode(', ', $columns) . ") VALUES (" . implode(', ', $placeholders) . ")");
+            $stmt->execute($insertParams);
+            $recordId = $insertParams[0];
+        }
+
+        $this->sendResponse([
+            'message' => 'Bank details saved successfully',
+            'record_id' => $recordId,
+            'subaccount_code' => $subaccountCode,
+            'account_name' => $accountName,
+            'account_number' => $accountNumber,
+            'masked_account_number' => '****' . substr($accountNumber, -4),
+            'bank_code' => $bankCode,
+            'bank_name' => $bankName,
+            'country_id' => $countryId,
+            'gateway' => $gatewayName,
+            'is_verified' => true,
+            'verified_at' => date('Y-m-d H:i:s'),
+        ]);
+    }
+
+    private function resolveAccountNameInternal(string $gatewayName, array $config, string $bankCode, string $accountNumber, string $countryId): array {
+        if ($gatewayName === 'paystack') {
+            $query = '/bank/resolve?account_number=' . urlencode($accountNumber) . '&bank_code=' . urlencode($bankCode);
+            $response = $this->gatewayRequest($gatewayName, $config, 'GET', $query);
+            return [
+                'account_name' => $response['data']['account_name'] ?? '',
+                'account_number' => $response['data']['account_number'] ?? $accountNumber,
+                'bank_code' => $bankCode,
+                'bank_name' => $response['data']['bank_name'] ?? null,
+            ];
+        }
+
+        if ($gatewayName === 'flutterwave') {
+            $response = $this->gatewayRequest($gatewayName, $config, 'POST', '/accounts/resolve', [
+                'account_number' => $accountNumber,
+                'account_bank' => $bankCode,
+            ]);
+            return [
+                'account_name' => $response['data']['account_name'] ?? '',
+                'account_number' => $response['data']['account_number'] ?? $accountNumber,
+                'bank_code' => $bankCode,
+                'bank_name' => $response['data']['bank_name'] ?? null,
+            ];
+        }
+
+        return [
+            'account_name' => '',
+            'account_number' => $accountNumber,
+            'bank_code' => $bankCode,
+            'bank_name' => null,
+        ];
+    }
+
+    private function gatewayRequest(string $gatewayName, array $config, string $method, string $endpoint, array $payload = []): array {
+        $gatewayName = strtolower($gatewayName);
+        if ($gatewayName === 'paystack') {
+            $baseUrl = rtrim($config['base_url'] ?? 'https://api.paystack.co', '/');
+            $secret = $config['secret_key'] ?? '';
+            if ($secret === '') {
+                throw new Exception('Paystack secret key is missing');
+            }
+        } elseif ($gatewayName === 'flutterwave') {
+            $baseUrl = rtrim($config['base_url'] ?? 'https://api.flutterwave.com/v3', '/');
+            $secret = $config['secret_key'] ?? '';
+            if ($secret === '') {
+                throw new Exception('Flutterwave secret key is missing');
+            }
+        } else {
+            throw new Exception('Unsupported gateway for this operation');
+        }
+
+        $url = $baseUrl . $endpoint;
+        $ch = curl_init($url);
+        $headers = [
+            'Authorization: Bearer ' . $secret,
+            'Content-Type: application/json',
+        ];
+        $opts = [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_TIMEOUT => 30,
+        ];
+        if (strtoupper($method) === 'POST') {
+            $opts[CURLOPT_POST] = true;
+            $opts[CURLOPT_POSTFIELDS] = json_encode($payload);
+        }
+        curl_setopt_array($ch, $opts);
+        $responseBody = curl_exec($ch);
+        if ($responseBody === false) {
+            $error = curl_error($ch);
+            curl_close($ch);
+            throw new Exception('Gateway request failed: ' . $error);
+        }
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        $decoded = json_decode($responseBody, true) ?: [];
+        if ($httpCode < 200 || $httpCode >= 300) {
+            $message = $decoded['message'] ?? ('Gateway HTTP ' . $httpCode);
+            throw new Exception($message);
+        }
+        return $decoded;
     }
 }

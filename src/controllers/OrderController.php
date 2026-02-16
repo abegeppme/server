@@ -6,6 +6,7 @@
 require_once __DIR__ . '/BaseController.php';
 require_once __DIR__ . '/../middleware/AuthMiddleware.php';
 require_once __DIR__ . '/../utils/PaymentBreakdownCalculator.php';
+require_once __DIR__ . '/../utils/RuntimeSettings.php';
 require_once __DIR__ . '/../payment/PaymentGatewayFactory.php';
 require_once __DIR__ . '/../utils/CountryManager.php';
 require_once __DIR__ . '/../services/EmailService.php';
@@ -185,7 +186,7 @@ class OrderController extends BaseController {
         }
         $subtotal = floatval($subtotal);
         
-        $serviceCharge = floatval($data['service_charge'] ?? getenv('SERVICE_CHARGE') ?: 250);
+        $serviceCharge = floatval($data['service_charge'] ?? RuntimeSettings::get('SERVICE_CHARGE', 250));
         
         // Calculate payment breakdown
         $breakdown = $this->breakdownCalculator->calculate([
@@ -318,16 +319,19 @@ class OrderController extends BaseController {
         $data = $this->getRequestBody();
         $completionDocuments = $data['completion_documents'] ?? [];
         
-        // Update order
+        // Update order - Set 7-day auto-release date
+        $autoReleaseDate = date('Y-m-d H:i:s', strtotime('+7 days'));
         $updateStmt = $this->db->prepare("
             UPDATE orders 
-            SET vendor_complete = 1, 
+            SET vendor_complete = 1,
+                vendor_completed_at = NOW(),
+                auto_release_date = ?,
                 status = 'AWAITING_CONFIRMATION',
                 completion_documents = ?,
                 updated_at = NOW()
             WHERE id = ?
         ");
-        $updateStmt->execute([json_encode($completionDocuments), $id]);
+        $updateStmt->execute([$autoReleaseDate, json_encode($completionDocuments), $id]);
         
         // Notify customer
         $customerStmt = $this->db->prepare("SELECT * FROM users WHERE id = ?");
@@ -372,19 +376,21 @@ class OrderController extends BaseController {
             $this->sendError('Vendor has not marked service as complete', 400);
         }
         
-        // Update order
+        // Update order - Start 48-hour hold period
+        $payoutReleaseDate = date('Y-m-d H:i:s', strtotime('+48 hours'));
         $updateStmt = $this->db->prepare("
             UPDATE orders 
-            SET customer_confirmed = 1, 
-                status = 'COMPLETED',
-                completed_at = NOW(),
+            SET customer_confirmed = 1,
+                customer_confirmed_at = NOW(),
+                payout_release_date = ?,
+                status = 'AWAITING_PAYOUT',
                 updated_at = NOW()
             WHERE id = ?
         ");
-        $updateStmt->execute([$id]);
+        $updateStmt->execute([$payoutReleaseDate, $id]);
         
-        // Process balance payment (release escrow)
-        $this->processBalancePayment($id);
+        // DO NOT process balance payment immediately - wait for 48-hour hold period
+        // Payment will be released by cron job after 48 hours if no dispute is raised
         
         // Notify vendor
         $vendorStmt = $this->db->prepare("SELECT * FROM users WHERE id = ?");

@@ -23,7 +23,7 @@ server {
     # CORS headers
     add_header Access-Control-Allow-Origin $http_origin always;
     add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
-    add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
+    add_header Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, X-Requested-With" always;
     add_header Access-Control-Allow-Credentials "true" always;
 
     # Handle preflight requests

@@ -69,7 +69,7 @@ class UserController extends BaseController {
     public function get($id) {
         $currentUser = $this->auth->requireAuth();
         
-        if ($id === 'profile') {
+        if ($id === 'profile' || $id === 'me') {
             // Get current user profile
             $stmt = $this->db->prepare("
                 SELECT u.*, c.name as country_name, cur.symbol as currency_symbol
@@ -92,6 +92,8 @@ class UserController extends BaseController {
             $user['stats'] = $stats;
             
             $this->sendResponse($user);
+        } elseif ($id === 'search') {
+            $this->searchUsers($currentUser);
         } else {
             // Get user by ID (admin only or self)
             if ($currentUser['role'] !== 'ADMIN' && $currentUser['id'] !== $id) {
@@ -124,7 +126,7 @@ class UserController extends BaseController {
         $currentUser = $this->auth->requireAuth();
         $data = $this->getRequestBody();
         
-        if ($id === 'profile') {
+        if ($id === 'profile' || $id === 'me') {
             // Update current user profile
             $userId = $currentUser['id'];
         } else {
@@ -249,5 +251,51 @@ class UserController extends BaseController {
         }
         
         return $stats;
+    }
+
+    /**
+     * Search users for chat/mentions
+     */
+    private function searchUsers(array $currentUser): void {
+        $q = trim($_GET['q'] ?? '');
+        $vendorId = trim($_GET['vendor_id'] ?? '');
+        $limit = min(50, max(1, intval($_GET['limit'] ?? 20)));
+
+        if ($q === '' && $vendorId === '') {
+            $this->sendResponse([]);
+        }
+
+        $conditions = [];
+        $params = [];
+
+        if ($q !== '') {
+            $conditions[] = "(name LIKE ? OR email LIKE ?)";
+            $like = '%' . $q . '%';
+            $params[] = $like;
+            $params[] = $like;
+        }
+
+        if ($vendorId !== '') {
+            $conditions[] = "id = ?";
+            $params[] = $vendorId;
+        }
+
+        $query = "
+            SELECT id, email, name, role, status, avatar
+            FROM users
+            WHERE status = 'ACTIVE'
+              AND id <> ?
+              AND (" . implode(' OR ', $conditions) . ")
+            ORDER BY name ASC
+            LIMIT ?
+        ";
+        array_unshift($params, $currentUser['id']);
+        $params[] = $limit;
+
+        $stmt = $this->db->prepare($query);
+        $stmt->execute($params);
+        $users = $stmt->fetchAll();
+
+        $this->sendResponse($users);
     }
 }

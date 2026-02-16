@@ -36,3 +36,24 @@ coverage/
 
 # Prisma
 prisma/migrations/
+
+# Documentation and Instructions
+*.md
+!README.md
+*_GUIDE.md
+*_INSTRUCTIONS.md
+*_SUMMARY.md
+*_CHECKLIST.md
+*_TEMPLATE.md
+*_COMPLETE.md
+*_FIXES.md
+*_UPDATES.md
+*_ANALYSIS.md
+*_QUICK_START.md
+*_TESTING.md
+*_SETUP.md
+*.html
+*.docx
+*.doc
+AbegEppMe*.html
+AbegEppMe*.docx

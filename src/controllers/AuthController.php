@@ -6,6 +6,7 @@
 require_once __DIR__ . '/BaseController.php';
 require_once __DIR__ . '/../auth/JWTAuth.php';
 require_once __DIR__ . '/../middleware/AuthMiddleware.php';
+require_once __DIR__ . '/../utils/WordPressPassword.php';
 
 class AuthController extends BaseController {
     private $jwt;
@@ -15,6 +16,8 @@ class AuthController extends BaseController {
         parent::__construct();
         $this->jwt = new JWTAuth();
         $this->auth = new AuthMiddleware();
+        $this->ensurePasswordResetTable();
+        $this->ensureUserConsentTable();
     }
     
     public function index() {
@@ -38,8 +41,20 @@ class AuthController extends BaseController {
             case 'sign-in':
                 $this->signIn($data);
                 break;
+            case 'sign-out':
+                $this->sendResponse(['message' => 'Signed out']);
+                break;
+            case 'forgot-password':
+                $this->forgotPassword($data);
+                break;
+            case 'reset-password':
+                $this->resetPassword($data);
+                break;
+            case 'change-password':
+                $this->changePassword($data);
+                break;
             default:
-                $this->sendError('Invalid action. Use "sign-up" or "sign-in"', 400);
+                $this->sendError('Invalid action', 400);
         }
     }
     
@@ -48,14 +63,32 @@ class AuthController extends BaseController {
         $email = $data['email'] ?? '';
         $password = $data['password'] ?? '';
         $name = $data['name'] ?? '';
+        $username = trim($data['username'] ?? '');
         $country_id = $data['country_id'] ?? 'NG';
+        $termsAccepted = !empty($data['terms_accepted']);
+        $mailingListOptIn = !empty($data['mailing_list_opt_in']);
         
-        if (empty($email) || empty($password)) {
-            $this->sendError('Email and password are required', 400);
+        if (empty($email) || empty($password) || empty($name) || empty($username)) {
+            $this->sendError('Username, name, email, and password are required', 400);
         }
         
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             $this->sendError('Invalid email format', 400);
+        }
+
+        if (!$termsAccepted) {
+            $this->sendError('You must accept the terms and conditions', 400);
+        }
+
+        if (!$mailingListOptIn) {
+            $this->sendError('You must agree to join the mailing list', 400);
+        }
+
+        if (!$this->isStrongPassword($password)) {
+            $this->sendError(
+                'Password must be at least 8 characters and include one uppercase letter, one number, and one special character',
+                400
+            );
         }
         
         // Check if user exists
@@ -75,6 +108,22 @@ class AuthController extends BaseController {
             VALUES (?, ?, ?, ?, 'CUSTOMER', 'ACTIVE', ?, 'NGN')
         ");
         $insertStmt->execute([$userId, $email, $name, $hashedPassword, $country_id]);
+
+        // Store consent and marketing preference for contact list usage.
+        $consentStmt = $this->db->prepare("
+            INSERT INTO user_contact_preferences (
+                id, user_id, email, name, username, terms_accepted_at, mailing_list_opt_in, source, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, NOW(), ?, 'signup', NOW(), NOW())
+        ");
+        $consentStmt->execute([
+            $this->generateUUID(),
+            $userId,
+            $email,
+            $name,
+            $username,
+            $mailingListOptIn ? 1 : 0,
+        ]);
         
         // Generate token
         $token = $this->jwt->generateToken([
@@ -84,9 +133,10 @@ class AuthController extends BaseController {
         ]);
         
         // Get created user
-        $userStmt = $this->db->prepare("SELECT id, email, name, role, country_id FROM users WHERE id = ?");
+        $userStmt = $this->db->prepare("SELECT * FROM users WHERE id = ?");
         $userStmt->execute([$userId]);
         $user = $userStmt->fetch();
+        unset($user['password']);
         
         $this->sendResponse([
             'token' => $token,
@@ -112,20 +162,7 @@ class AuthController extends BaseController {
         }
         
         // Verify password (supports both WordPress and PHP password_hash)
-        $passwordValid = false;
-        
-        // Try PHP password_verify first
-        if (password_verify($password, $user['password'])) {
-            $passwordValid = true;
-        } else {
-            // Try WordPress password check (if migrated from WP)
-            // WordPress uses $P$ or $2y$ format
-            if (strpos($user['password'], '$P$') === 0 || strpos($user['password'], '$2y$') === 0) {
-                // WordPress password - use wp_check_password equivalent
-                // For now, we'll need to update passwords on first login
-                $passwordValid = false; // Will need to re-hash
-            }
-        }
+        $passwordValid = WordPressPassword::checkPassword($password, $user['password']);
         
         if (!$passwordValid) {
             $this->sendError('Invalid email or password', 401);
@@ -135,12 +172,12 @@ class AuthController extends BaseController {
         if ($user['status'] !== 'ACTIVE') {
             $this->sendError('Account is not active', 403);
         }
-        
-        // Re-hash password if it's WordPress format (for security)
-        if (strpos($user['password'], '$P$') === 0) {
-            $newHash = password_hash($password, PASSWORD_DEFAULT);
-            $updateStmt = $this->db->prepare("UPDATE users SET password = ? WHERE id = ?");
-            $updateStmt->execute([$newHash, $user['id']]);
+
+        // Logged-in but forced reset flow for migrated WordPress hashes.
+        $mustResetPassword = $this->requiresWordPressPasswordReset($user);
+        $resetToken = null;
+        if ($mustResetPassword) {
+            $resetToken = $this->createResetToken($user['id']);
         }
         
         // Generate token
@@ -151,23 +188,246 @@ class AuthController extends BaseController {
         ]);
         
         unset($user['password']); // Don't send password
+        $user['requires_password_reset'] = $mustResetPassword;
         
         $this->sendResponse([
             'token' => $token,
             'user' => $user,
+            'requires_password_reset' => $mustResetPassword,
+            // Safe to return here since user has already authenticated.
+            'reset_token' => $resetToken,
+            'reset_link' => $mustResetPassword
+                ? '/auth/reset-password?token=' . urlencode($resetToken)
+                : null,
         ]);
     }
     
     public function get($id = null) {
-        if ($id === 'session') {
-            $user = $this->auth->getCurrentUser();
-            if (!$user) {
-                $this->sendError('Not authenticated', 401);
-            }
-            unset($user['password']);
-            $this->sendResponse(['user' => $user]);
-        } else {
+        if ($id !== null && $id !== 'session') {
             $this->sendError('Invalid endpoint', 404);
         }
+
+        $user = $this->auth->getCurrentUser();
+        if (!$user) {
+            $this->sendError('Not authenticated', 401);
+        }
+        $mustResetPassword = $this->requiresWordPressPasswordReset($user);
+        unset($user['password']);
+        $user['requires_password_reset'] = $mustResetPassword;
+        $this->sendResponse($user);
+    }
+
+    private function forgotPassword($data) {
+        $email = trim($data['email'] ?? '');
+        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $this->sendError('Valid email is required', 400);
+        }
+
+        $stmt = $this->db->prepare("SELECT id, email FROM users WHERE email = ? LIMIT 1");
+        $stmt->execute([$email]);
+        $user = $stmt->fetch();
+
+        // Always return generic success to avoid account enumeration.
+        if (!$user) {
+            $this->sendResponse([
+                'message' => 'If this email exists, a reset link has been generated.',
+            ]);
+        }
+
+        $token = $this->createResetToken($user['id']);
+
+        $payload = [
+            'message' => 'If this email exists, a reset link has been generated.',
+        ];
+        if (APP_ENV === 'development') {
+            $payload['dev_token'] = $token;
+            $payload['reset_link'] = '/auth/reset-password?token=' . urlencode($token);
+        }
+
+        $this->sendResponse($payload);
+    }
+
+    private function resetPassword($data) {
+        $token = trim($data['token'] ?? '');
+        $password = $data['password'] ?? '';
+
+        if (empty($token) || empty($password)) {
+            $this->sendError('Token and password are required', 400);
+        }
+
+        if (!$this->isStrongPassword($password)) {
+            $this->sendError(
+                'Password must be at least 8 characters and include one uppercase letter, one number, and one special character',
+                400
+            );
+        }
+
+        $tokenHash = hash('sha256', $token);
+        $stmt = $this->db->prepare("
+            SELECT id, user_id
+            FROM password_reset_tokens
+            WHERE token_hash = ?
+              AND used_at IS NULL
+              AND expires_at >= NOW()
+            ORDER BY created_at DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$tokenHash]);
+        $reset = $stmt->fetch();
+
+        if (!$reset) {
+            $this->sendError('Invalid or expired reset token', 400);
+        }
+
+        $newHash = password_hash($password, PASSWORD_DEFAULT);
+
+        $this->db->beginTransaction();
+        try {
+            $updateUserStmt = $this->db->prepare("UPDATE users SET password = ? WHERE id = ?");
+            $updateUserStmt->execute([$newHash, $reset['user_id']]);
+
+            $markUsedStmt = $this->db->prepare("UPDATE password_reset_tokens SET used_at = NOW() WHERE id = ?");
+            $markUsedStmt->execute([$reset['id']]);
+
+            // Invalidate older active tokens for this user.
+            $invalidateStmt = $this->db->prepare("
+                UPDATE password_reset_tokens
+                SET used_at = NOW()
+                WHERE user_id = ?
+                  AND used_at IS NULL
+            ");
+            $invalidateStmt->execute([$reset['user_id']]);
+
+            $this->db->commit();
+        } catch (Exception $e) {
+            $this->db->rollBack();
+            throw $e;
+        }
+
+        $this->sendResponse(['message' => 'Password reset successful']);
+    }
+
+    private function changePassword($data) {
+        $currentUser = $this->auth->requireAuth();
+        $currentPassword = $data['current_password'] ?? '';
+        $newPassword = $data['new_password'] ?? '';
+
+        if (empty($currentPassword) || empty($newPassword)) {
+            $this->sendError('Current password and new password are required', 400);
+        }
+
+        if (!$this->isStrongPassword($newPassword)) {
+            $this->sendError(
+                'New password must be at least 8 characters and include one uppercase letter, one number, and one special character',
+                400
+            );
+        }
+
+        $stmt = $this->db->prepare("SELECT id, password FROM users WHERE id = ? LIMIT 1");
+        $stmt->execute([$currentUser['id']]);
+        $user = $stmt->fetch();
+        if (!$user) {
+            $this->sendError('User not found', 404);
+        }
+
+        $passwordValid = WordPressPassword::checkPassword($currentPassword, $user['password']);
+        if (!$passwordValid) {
+            $this->sendError('Current password is incorrect', 400);
+        }
+
+        $newHash = password_hash($newPassword, PASSWORD_DEFAULT);
+        $updateStmt = $this->db->prepare("UPDATE users SET password = ? WHERE id = ?");
+        $updateStmt->execute([$newHash, $currentUser['id']]);
+
+        $this->sendResponse(['message' => 'Password updated successfully']);
+    }
+
+    private function isStrongPassword($password): bool {
+        if (strlen($password) < 8) {
+            return false;
+        }
+        if (!preg_match('/[A-Z]/', $password)) {
+            return false;
+        }
+        if (!preg_match('/\d/', $password)) {
+            return false;
+        }
+        if (!preg_match('/[^A-Za-z0-9]/', $password)) {
+            return false;
+        }
+        return true;
+    }
+
+    private function createResetToken(string $userId): string {
+        $token = bin2hex(random_bytes(24));
+        $tokenHash = hash('sha256', $token);
+        $expiresAt = date('Y-m-d H:i:s', strtotime('+60 minutes'));
+
+        $stmt = $this->db->prepare("
+            INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, created_at)
+            VALUES (?, ?, ?, ?, NOW())
+        ");
+        $stmt->execute([
+            $this->generateUUID(),
+            $userId,
+            $tokenHash,
+            $expiresAt,
+        ]);
+
+        return $token;
+    }
+
+    private function ensurePasswordResetTable(): void {
+        $this->db->exec("
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id CHAR(36) NOT NULL PRIMARY KEY,
+                user_id CHAR(36) NOT NULL,
+                token_hash VARCHAR(64) NOT NULL,
+                expires_at DATETIME NOT NULL,
+                used_at DATETIME NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_prt_user_id (user_id),
+                UNIQUE KEY uk_prt_token_hash (token_hash)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        ");
+    }
+
+    private function ensureUserConsentTable(): void {
+        $this->db->exec("
+            CREATE TABLE IF NOT EXISTS user_contact_preferences (
+                id CHAR(36) NOT NULL PRIMARY KEY,
+                user_id CHAR(36) NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                name VARCHAR(255) NULL,
+                username VARCHAR(255) NULL,
+                terms_accepted_at DATETIME NULL,
+                mailing_list_opt_in TINYINT(1) NOT NULL DEFAULT 0,
+                source VARCHAR(64) NOT NULL DEFAULT 'signup',
+                mailchimp_synced_at DATETIME NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uk_ucp_user_id (user_id),
+                INDEX idx_ucp_email (email),
+                INDEX idx_ucp_mailing (mailing_list_opt_in)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        ");
+    }
+
+    private function sendJson(array $payload, int $statusCode): void {
+        http_response_code($statusCode);
+        echo json_encode($payload);
+        exit();
+    }
+
+    private function requiresWordPressPasswordReset(array $user): bool {
+        $requireReset = (getenv('REQUIRE_WORDPRESS_PASSWORD_RESET') ?: 'false') === 'true';
+        if (!$requireReset) {
+            return false;
+        }
+        $passwordHash = $user['password'] ?? '';
+        if (!is_string($passwordHash) || $passwordHash === '') {
+            return false;
+        }
+        return WordPressPassword::isWordPressHash($passwordHash);
     }
 }

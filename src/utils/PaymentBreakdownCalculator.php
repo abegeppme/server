@@ -3,6 +3,7 @@
  * Payment Breakdown Calculator
  * Calculates payment splits for orders
  */
+require_once __DIR__ . '/RuntimeSettings.php';
 
 class PaymentBreakdownCalculator {
     private $vendorInitialPct;
@@ -13,11 +14,11 @@ class PaymentBreakdownCalculator {
     private $insuranceSubaccount;
     
     public function __construct() {
-        $this->vendorInitialPct = floatval(getenv('VENDOR_INITIAL_PERCENTAGE') ?: 50);
-        $this->insurancePct = floatval(getenv('INSURANCE_PERCENTAGE') ?: 1);
-        $this->commissionPct = floatval(getenv('COMMISSION_PERCENTAGE') ?: 5);
-        $this->vatPct = floatval(getenv('VAT_PERCENTAGE') ?: 7.5);
-        $this->serviceCharge = floatval(getenv('SERVICE_CHARGE') ?: 250);
+        $this->vendorInitialPct = floatval(RuntimeSettings::get('VENDOR_INITIAL_PERCENTAGE', 50));
+        $this->insurancePct = floatval(RuntimeSettings::get('INSURANCE_PERCENTAGE', 1));
+        $this->commissionPct = floatval(RuntimeSettings::get('COMMISSION_PERCENTAGE', 5));
+        $this->vatPct = floatval(RuntimeSettings::get('VAT_PERCENTAGE', 7.5));
+        $this->serviceCharge = floatval(RuntimeSettings::get('SERVICE_CHARGE', 250));
         $this->insuranceSubaccount = getenv('INSURANCE_SUBACCOUNT_CODE') ?: '';
     }
     

@@ -113,12 +113,14 @@ class MigrationController extends BaseController {
             'prefix' => $data['wp_prefix'] ?? 'wp_',
         ];
         
-        // Migration options
-        $options = [
-            'migrate_users' => $data['migrate_users'] ?? true,
-            'migrate_subaccounts' => $data['migrate_subaccounts'] ?? true,
-            'migrate_orders' => $data['migrate_orders'] ?? true,
-        ];
+            // Migration options
+            $options = [
+                'migrate_users' => $data['migrate_users'] ?? true,
+                'migrate_subaccounts' => $data['migrate_subaccounts'] ?? true,
+                'migrate_orders' => $data['migrate_orders'] ?? true,
+                'migrate_categories' => $data['migrate_categories'] ?? true,
+                'migrate_services' => $data['migrate_services'] ?? true,
+            ];
         
         try {
             // Connect to WordPress database
@@ -139,6 +141,8 @@ class MigrationController extends BaseController {
                 'users' => ['migrated' => 0, 'skipped' => 0, 'total' => 0],
                 'subaccounts' => ['migrated' => 0, 'skipped' => 0, 'total' => 0],
                 'orders' => ['migrated' => 0, 'skipped' => 0, 'total' => 0],
+                'categories' => ['migrated' => 0, 'skipped' => 0, 'total' => 0],
+                'services' => ['migrated' => 0, 'skipped' => 0, 'total' => 0],
             ];
             
             $user_mapping = [];
@@ -179,6 +183,35 @@ class MigrationController extends BaseController {
                     'migrated' => $orderResult['migrated'],
                     'skipped' => $orderResult['skipped'],
                     'total' => $orderResult['migrated'] + $orderResult['skipped'],
+                ];
+            }
+            
+            // Migrate vendor categories
+            if ($options['migrate_categories'] && !empty($user_mapping)) {
+                $categoryResult = $this->migrationService->migrateVendorCategories(
+                    $wp_pdo, 
+                    $wp_db_config['prefix'], 
+                    $user_mapping
+                );
+                $results['categories'] = [
+                    'migrated' => $categoryResult['migrated'] ?? 0,
+                    'skipped' => $categoryResult['skipped'] ?? 0,
+                    'total' => ($categoryResult['migrated'] ?? 0) + ($categoryResult['skipped'] ?? 0),
+                    'category_mappings' => $categoryResult['category_mappings'] ?? 0,
+                ];
+            }
+
+            // Migrate services (WooCommerce products)
+            if ($options['migrate_services'] && !empty($user_mapping)) {
+                $servicesResult = $this->migrationService->migrateServices(
+                    $wp_pdo,
+                    $wp_db_config['prefix'],
+                    $user_mapping
+                );
+                $results['services'] = [
+                    'migrated' => $servicesResult['migrated'] ?? 0,
+                    'skipped' => $servicesResult['skipped'] ?? 0,
+                    'total' => ($servicesResult['migrated'] ?? 0) + ($servicesResult['skipped'] ?? 0),
                 ];
             }
             

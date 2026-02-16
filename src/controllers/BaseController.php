@@ -127,4 +127,28 @@ class BaseController {
             mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
         );
     }
+    
+    /**
+     * Check if a column exists in a table
+     */
+    protected function checkColumnExists($table, $column) {
+        try {
+            $stmt = $this->db->query("SHOW COLUMNS FROM `{$table}` LIKE '{$column}'");
+            return $stmt->rowCount() > 0;
+        } catch (Exception $e) {
+            return false;
+        }
+    }
+    
+    /**
+     * Check if a table exists
+     */
+    protected function checkTableExists($table) {
+        try {
+            $stmt = $this->db->query("SHOW TABLES LIKE '{$table}'");
+            return $stmt->rowCount() > 0;
+        } catch (Exception $e) {
+            return false;
+        }
+    }
 }

@@ -1,0 +1,22 @@
+[
+  {
+    "term": "Escrow",
+    "definition": "A payment safety mechanism where funds are held until service completion conditions are met.",
+    "category": "payments"
+  },
+  {
+    "term": "Vendor",
+    "definition": "A service provider who has completed onboarding and can publish services on the platform.",
+    "category": "users"
+  },
+  {
+    "term": "Customer",
+    "definition": "A user who can browse services, place orders, and confirm service completion.",
+    "category": "users"
+  },
+  {
+    "term": "Dispute",
+    "definition": "A formal complaint raised during an order to request admin oversight before payout release.",
+    "category": "orders"
+  }
+]

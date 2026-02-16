@@ -7,6 +7,7 @@
 require_once __DIR__ . '/PaymentGatewayInterface.php';
 require_once __DIR__ . '/gateways/PaystackGateway.php';
 require_once __DIR__ . '/gateways/FlutterwaveGateway.php';
+require_once __DIR__ . '/gateways/PalmpayGateway.php';
 
 class PaymentGatewayFactory {
     /**
@@ -21,6 +22,9 @@ class PaymentGatewayFactory {
                 return new PaystackGateway($config);
             case 'flutterwave':
                 return new FlutterwaveGateway($config);
+            case 'palmpay':
+            case 'palm-pay':
+                return new PalmpayGateway($config);
             default:
                 throw new Exception("Unsupported payment gateway: $gatewayName");
         }

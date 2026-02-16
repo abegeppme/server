@@ -5,10 +5,18 @@
 
 // Set headers
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: ' . (getenv('CORS_ORIGIN') ?: '*'));
+
+// Handle CORS correctly for Credentials
+$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+if (!empty($origin)) {
+    header("Access-Control-Allow-Origin: $origin");
+    header('Access-Control-Allow-Credentials: true');
+} else {
+    header('Access-Control-Allow-Origin: *');
+}
+
 header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization');
-header('Access-Control-Allow-Credentials: true');
+header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key, X-Requested-With');
 
 // Handle preflight requests
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -19,6 +27,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 // Load configuration
 require_once __DIR__ . '/config/config.php';
 require_once __DIR__ . '/config/database.php';
+
+// Load API Key Middleware
+require_once __DIR__ . '/src/middleware/ApiKeyMiddleware.php';
 
 // Autoloader
 spl_autoload_register(function ($class) {
@@ -63,16 +74,23 @@ set_exception_handler(function ($exception) {
 $request_uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $request_method = $_SERVER['REQUEST_METHOD'];
 
-// Remove the base path (server directory)
-$base_paths = [
-    '/abegeppme-v4/server',
-    '/server',
-];
-foreach ($base_paths as $base_path) {
-    if (strpos($request_uri, $base_path) === 0) {
-        $request_uri = substr($request_uri, strlen($base_path));
-        break;
-    }
+// Dynamic base path detection
+$script_name = $_SERVER['SCRIPT_NAME'];
+$base_path = dirname($script_name);
+$base_path = str_replace('\\', '/', $base_path); // Normalize Windows paths
+
+if ($base_path !== '/') {
+    $base_path = rtrim($base_path, '/');
+}
+
+// Remove base path from request URI
+if (strpos($request_uri, $base_path) === 0) {
+    $request_uri = substr($request_uri, strlen($base_path));
+}
+
+// Ensure URI starts with slash
+if (empty($request_uri) || $request_uri[0] !== '/') {
+    $request_uri = '/' . $request_uri;
 }
 
 // Remove /api prefix if present
@@ -90,7 +108,9 @@ try {
     $id = null;
     
     if (empty($segments[0]) || $segments[0] === '') {
-        // Root API endpoint
+        // Root API endpoint - Return 404 or empty response
+        // Uncomment below to show API info (not recommended for production)
+        /*
         echo json_encode([
             'success' => true,
             'message' => 'AbegEppMe API v' . APP_VERSION,
@@ -107,9 +127,25 @@ try {
                 'reviews' => '/api/reviews',
                 'invoices' => '/api/invoices',
                 'migration' => '/api/migration',
+                'categories' => '/api/categories',
             ]
         ]);
+        */
+        http_response_code(404);
+        echo json_encode([
+            'success' => false,
+            'error' => ['message' => 'Not Found']
+        ]);
         exit();
+    }
+    
+    // Initialize API Key Middleware
+    $apiKeyMiddleware = new ApiKeyMiddleware();
+    $currentPath = '/' . implode('/', $segments);
+    
+    // Check API key for non-public endpoints
+    if (!$apiKeyMiddleware->isPublicEndpoint($currentPath)) {
+        $apiKeyMiddleware->checkApiKey();
     }
     
     $resource = $segments[0];
@@ -168,6 +204,11 @@ try {
             $controller = new ReviewController();
             break;
             
+        case 'disputes':
+            require_once __DIR__ . '/src/controllers/DisputeController.php';
+            $controller = new DisputeController();
+            break;
+            
         case 'invoices':
             require_once __DIR__ . '/src/controllers/InvoiceController.php';
             $controller = new InvoiceController();
@@ -176,6 +217,26 @@ try {
         case 'migration':
             require_once __DIR__ . '/src/controllers/MigrationController.php';
             $controller = new MigrationController();
+            break;
+            
+        case 'categories':
+            require_once __DIR__ . '/src/controllers/CategoryController.php';
+            $controller = new CategoryController();
+            break;
+            
+        case 'media':
+            require_once __DIR__ . '/src/controllers/MediaController.php';
+            $controller = new MediaController();
+            break;
+            
+        case 'cron':
+            require_once __DIR__ . '/src/controllers/CronController.php';
+            $controller = new CronController();
+            break;
+        
+        case 'ai':
+            require_once __DIR__ . '/src/controllers/AIController.php';
+            $controller = new AIController();
             break;
             
         default:

@@ -19,6 +19,44 @@ class ChatController extends BaseController {
         $this->chatService = new ChatService();
         $this->pushService = new PushNotificationService();
     }
+
+    public function handleRequest($method, $id = null, $sub_resource = null) {
+        $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?: '';
+        $chatPrefixPos = strpos($requestPath, '/api/chat');
+        if ($chatPrefixPos === false) {
+            parent::handleRequest($method, $id, $sub_resource);
+            return;
+        }
+
+        $tail = trim(substr($requestPath, $chatPrefixPos + strlen('/api/chat')), '/');
+        $segments = $tail === '' ? [] : explode('/', $tail);
+
+        if ($method === 'GET') {
+            if (count($segments) === 0 || (count($segments) === 1 && $segments[0] === 'conversations')) {
+                $this->index();
+                return;
+            }
+
+            if ($segments[0] === 'conversations' && count($segments) >= 3 && $segments[2] === 'messages') {
+                $this->getMessages($segments[1]);
+                return;
+            }
+
+            if ($segments[0] === 'conversations' && isset($segments[1])) {
+                $this->get($segments[1]);
+                return;
+            }
+        }
+
+        if ($method === 'POST') {
+            if (count($segments) === 0 || (count($segments) === 1 && $segments[0] === 'messages')) {
+                $this->create();
+                return;
+            }
+        }
+
+        $this->sendError('Endpoint not found', 404);
+    }
     
     public function index() {
         $user = $this->auth->requireAuth();
@@ -28,23 +66,7 @@ class ChatController extends BaseController {
     
     public function get($id) {
         $user = $this->auth->requireAuth();
-        
-        // Check if it's a conversation ID or "messages" endpoint
-        if (strpos($id, '/') !== false) {
-            list($conversationId, $action) = explode('/', $id, 2);
-            if ($action === 'messages') {
-                $limit = intval($_GET['limit'] ?? 50);
-                $before = $_GET['before'] ?? null;
-                $messages = $this->chatService->getMessages($conversationId, $limit, $before);
-                
-                // Mark as read
-                $this->chatService->markAsRead($conversationId, $user['id']);
-                
-                $this->sendResponse($messages);
-                return;
-            }
-        }
-        
+
         // Get conversation details
         $stmt = $this->db->prepare("
             SELECT c.*, 
@@ -63,6 +85,18 @@ class ChatController extends BaseController {
         }
         
         $this->sendResponse($conversation);
+    }
+
+    public function getMessages($conversationId) {
+        $user = $this->auth->requireAuth();
+        $limit = intval($_GET['limit'] ?? 50);
+        $before = $_GET['before'] ?? null;
+        $messages = $this->chatService->getMessages($conversationId, $limit, $before);
+
+        // Mark as read
+        $this->chatService->markAsRead($conversationId, $user['id']);
+
+        $this->sendResponse($messages);
     }
     
     public function create() {
