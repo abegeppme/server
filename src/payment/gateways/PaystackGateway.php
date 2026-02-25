@@ -14,7 +14,7 @@ class PaystackGateway implements PaymentGatewayInterface {
     public function __construct(array $config) {
         $this->secretKey = $config['secret_key'] ?? '';
         $this->publicKey = $config['public_key'] ?? '';
-        $this->webhookSecret = $config['webhook_secret'] ?? '';
+        $this->webhookSecret = $config['webhook_secret'] ?? $this->secretKey;
         $this->baseUrl = $config['base_url'] ?? 'https://api.paystack.co';
         
         if (empty($this->secretKey)) {
@@ -146,6 +146,9 @@ class PaystackGateway implements PaymentGatewayInterface {
     }
     
     public function verifyWebhookSignature(string $payload, string $signature): bool {
+        if (empty($this->webhookSecret) || empty($signature)) {
+            return false;
+        }
         $computedSignature = hash_hmac('sha512', $payload, $this->webhookSecret);
         return hash_equals($computedSignature, $signature);
     }

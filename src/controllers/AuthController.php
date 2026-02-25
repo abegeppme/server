@@ -53,6 +53,9 @@ class AuthController extends BaseController {
             case 'change-password':
                 $this->changePassword($data);
                 break;
+            case 'debug-auth':
+                $this->debugAuth($data);
+                break;
             default:
                 $this->sendError('Invalid action', 400);
         }
@@ -149,6 +152,7 @@ class AuthController extends BaseController {
         $password = $data['password'] ?? '';
         
         if (empty($email) || empty($password)) {
+            $this->logAuthEvent('SIGN_IN_MISSING_FIELDS', $email);
             $this->sendError('Email and password are required', 400);
         }
         
@@ -158,6 +162,7 @@ class AuthController extends BaseController {
         $user = $stmt->fetch();
         
         if (!$user) {
+            $this->logAuthEvent('SIGN_IN_USER_NOT_FOUND', $email);
             $this->sendError('Invalid email or password', 401);
         }
         
@@ -165,11 +170,19 @@ class AuthController extends BaseController {
         $passwordValid = WordPressPassword::checkPassword($password, $user['password']);
         
         if (!$passwordValid) {
+            $this->logAuthEvent('SIGN_IN_PASSWORD_INVALID', $email, [
+                'user_id' => $user['id'] ?? null,
+                'hash_type' => $this->classifyPasswordHash($user['password'] ?? ''),
+            ]);
             $this->sendError('Invalid email or password', 401);
         }
         
         // Check user status
         if ($user['status'] !== 'ACTIVE') {
+            $this->logAuthEvent('SIGN_IN_USER_INACTIVE', $email, [
+                'user_id' => $user['id'] ?? null,
+                'status' => $user['status'] ?? null,
+            ]);
             $this->sendError('Account is not active', 403);
         }
 
@@ -178,6 +191,10 @@ class AuthController extends BaseController {
         $resetToken = null;
         if ($mustResetPassword) {
             $resetToken = $this->createResetToken($user['id']);
+            $this->logAuthEvent('SIGN_IN_REQUIRES_PASSWORD_RESET', $email, [
+                'user_id' => $user['id'] ?? null,
+                'hash_type' => $this->classifyPasswordHash($user['password'] ?? ''),
+            ]);
         }
         
         // Generate token
@@ -199,6 +216,100 @@ class AuthController extends BaseController {
             'reset_link' => $mustResetPassword
                 ? '/auth/reset-password?token=' . urlencode($resetToken)
                 : null,
+        ]);
+    }
+
+    private function debugAuth(array $data): void {
+        // Keep this endpoint dev-only and admin-only.
+        if (APP_ENV !== 'development') {
+            $this->sendError('debug-auth is only available in development', 403);
+        }
+        $this->auth->requireAdmin();
+
+        $emails = [];
+        if (!empty($data['email']) && is_string($data['email'])) {
+            $emails[] = trim($data['email']);
+        }
+        if (!empty($data['emails']) && is_array($data['emails'])) {
+            foreach ($data['emails'] as $email) {
+                if (is_string($email) && trim($email) !== '') {
+                    $emails[] = trim($email);
+                }
+            }
+        }
+        $emails = array_values(array_unique(array_filter($emails, function ($email) {
+            return filter_var($email, FILTER_VALIDATE_EMAIL);
+        })));
+
+        if (count($emails) === 0) {
+            $this->sendError('Provide email or emails[] with valid email values', 400);
+        }
+
+        $testPassword = isset($data['test_password']) && is_string($data['test_password'])
+            ? $data['test_password']
+            : null;
+
+        $stmt = $this->db->prepare("SELECT * FROM users WHERE email = ? LIMIT 1");
+        $results = [];
+
+        foreach ($emails as $email) {
+            $stmt->execute([$email]);
+            $user = $stmt->fetch();
+
+            if (!$user) {
+                $results[] = [
+                    'email' => $email,
+                    'exists' => false,
+                    'can_sign_in' => false,
+                    'reasons' => ['USER_NOT_FOUND'],
+                ];
+                continue;
+            }
+
+            $status = strtoupper((string)($user['status'] ?? ''));
+            $hash = (string)($user['password'] ?? '');
+            $hashType = $this->classifyPasswordHash($hash);
+            $requiresReset = $this->requiresWordPressPasswordReset($user);
+            $passwordMatches = $testPassword !== null ? WordPressPassword::checkPassword($testPassword, $hash) : null;
+
+            $reasons = [];
+            if ($status !== 'ACTIVE') {
+                $reasons[] = 'USER_NOT_ACTIVE';
+            }
+            if ($testPassword !== null && $passwordMatches !== true) {
+                $reasons[] = 'PASSWORD_MISMATCH';
+            }
+            if ($requiresReset) {
+                $reasons[] = 'PASSWORD_RESET_REQUIRED';
+            }
+
+            $results[] = [
+                'email' => $email,
+                'exists' => true,
+                'user_id' => $user['id'] ?? null,
+                'name' => $user['name'] ?? null,
+                'status' => $status,
+                'role' => $user['role'] ?? null,
+                'flags' => [
+                    'is_vendor' => isset($user['is_vendor']) ? (string)$user['is_vendor'] : null,
+                    'is_customer' => isset($user['is_customer']) ? (string)$user['is_customer'] : null,
+                    'is_admin' => isset($user['is_admin']) ? (string)$user['is_admin'] : null,
+                    'is_manager' => isset($user['is_manager']) ? (string)$user['is_manager'] : null,
+                ],
+                'password_hash_type' => $hashType,
+                'requires_password_reset' => $requiresReset,
+                'password_matches' => $passwordMatches,
+                'can_sign_in' => count(array_filter($reasons, function ($reason) {
+                    return $reason !== 'PASSWORD_RESET_REQUIRED';
+                })) === 0,
+                'reasons' => $reasons,
+            ];
+        }
+
+        $this->sendResponse([
+            'generated_at' => date('c'),
+            'count' => count($results),
+            'results' => $results,
         ]);
     }
     
@@ -361,17 +472,14 @@ class AuthController extends BaseController {
     private function createResetToken(string $userId): string {
         $token = bin2hex(random_bytes(24));
         $tokenHash = hash('sha256', $token);
-        $expiresAt = date('Y-m-d H:i:s', strtotime('+60 minutes'));
-
         $stmt = $this->db->prepare("
             INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, created_at)
-            VALUES (?, ?, ?, ?, NOW())
+            VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 60 MINUTE), NOW())
         ");
         $stmt->execute([
             $this->generateUUID(),
             $userId,
             $tokenHash,
-            $expiresAt,
         ]);
 
         return $token;
@@ -420,7 +528,8 @@ class AuthController extends BaseController {
     }
 
     private function requiresWordPressPasswordReset(array $user): bool {
-        $requireReset = (getenv('REQUIRE_WORDPRESS_PASSWORD_RESET') ?: 'false') === 'true';
+        $envValue = getenv('REQUIRE_WORDPRESS_PASSWORD_RESET');
+        $requireReset = $envValue === false ? true : strtolower((string) $envValue) === 'true';
         if (!$requireReset) {
             return false;
         }
@@ -429,5 +538,28 @@ class AuthController extends BaseController {
             return false;
         }
         return WordPressPassword::isWordPressHash($passwordHash);
+    }
+
+    private function classifyPasswordHash(string $hash): string {
+        if ($hash === '') return 'EMPTY';
+        if (preg_match('/^[a-f0-9]{32}$/i', $hash)) return 'MD5_LEGACY';
+        if (strpos($hash, '$wp$2a$') === 0 || strpos($hash, '$wp$2y$') === 0) return 'WP_PREFIXED_BCRYPT';
+        if (strpos($hash, '$P$') === 0 || strpos($hash, '$H$') === 0) return 'WP_PORTABLE';
+        if (strpos($hash, '$2a$') === 0 || strpos($hash, '$2y$') === 0 || strpos($hash, '$2b$') === 0) return 'PHP_BCRYPT';
+        if (strpos($hash, '$argon2') === 0) return 'PHP_ARGON2';
+        return 'UNKNOWN';
+    }
+
+    private function logAuthEvent(string $event, string $email, array $meta = []): void {
+        if (APP_ENV !== 'development') {
+            return;
+        }
+        $payload = [
+            'event' => $event,
+            'email' => strtolower(trim($email)),
+            'meta' => $meta,
+            'at' => date('c'),
+        ];
+        error_log('[AUTH_DEBUG] ' . json_encode($payload));
     }
 }

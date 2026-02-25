@@ -9,9 +9,16 @@ class WordPressPassword {
      * Check if password hash is WordPress format
      */
     public static function isWordPressHash($hash) {
-        return strpos($hash, '$P$') === 0 || 
-               strpos($hash, '$2a$') === 0 || 
-               strpos($hash, '$2y$') === 0;
+        if (!is_string($hash) || $hash === '') {
+            return false;
+        }
+        // Treat only explicit WordPress hash families as "legacy WP".
+        // Plain PHP bcrypt hashes ($2y$ / $2a$) are considered modern hashes
+        // and should not force another reset after a successful password change.
+        return strpos($hash, '$P$') === 0 ||
+               strpos($hash, '$H$') === 0 ||
+               strpos($hash, '$wp$2a$') === 0 ||
+               strpos($hash, '$wp$2y$') === 0;
     }
     
     /**
@@ -19,13 +26,27 @@ class WordPressPassword {
      * WordPress uses phpass library which uses bcrypt with portable hashes
      */
     public static function checkPassword($password, $hash) {
+        if (!is_string($hash) || $hash === '') {
+            return false;
+        }
+
+        // Legacy imports may still contain unsalted MD5 hashes.
+        if (preg_match('/^[a-f0-9]{32}$/i', $hash)) {
+            return hash_equals(strtolower($hash), md5($password));
+        }
+
+        // Newer WordPress hashes may be prefixed with "$wp$".
+        if (strpos($hash, '$wp$') === 0) {
+            $hash = substr($hash, 3);
+        }
+
         // If it's not a WordPress hash, use standard PHP password_verify
         if (!self::isWordPressHash($hash)) {
             return password_verify($password, $hash);
         }
         
         // WordPress portable hash format: $P$B...
-        if (strpos($hash, '$P$') === 0) {
+        if (strpos($hash, '$P$') === 0 || strpos($hash, '$H$') === 0) {
             return self::checkPortableHash($password, $hash);
         }
         

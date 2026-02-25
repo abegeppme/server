@@ -422,6 +422,7 @@ class AdminController extends BaseController {
         $q = trim($_GET['q'] ?? '');
 
         $hasVendorFlag = $this->checkColumnExists('users', 'is_vendor');
+        $hasProfiles = $this->checkTableExists('service_provider_profiles');
         $where = $hasVendorFlag ? "u.is_vendor = 1" : "u.role = 'VENDOR'";
         $params = [];
 
@@ -431,19 +432,26 @@ class AdminController extends BaseController {
         }
 
         if ($q !== '') {
-            $where .= " AND (u.name LIKE ? OR u.email LIKE ? OR spp.business_name LIKE ?)";
+            $where .= " AND (u.name LIKE ? OR u.email LIKE ?" . ($hasProfiles ? " OR spp.business_name LIKE ?" : "") . ")";
             $like = '%' . $q . '%';
             $params[] = $like;
             $params[] = $like;
-            $params[] = $like;
+            if ($hasProfiles) {
+                $params[] = $like;
+            }
         }
+
+        $profileJoin = $hasProfiles ? "LEFT JOIN service_provider_profiles spp ON spp.user_id = u.id" : "";
+        $profileSelect = $hasProfiles
+            ? "spp.business_name, spp.description, spp.phone"
+            : "NULL AS business_name, NULL AS description, NULL AS phone";
 
         $query = "
             SELECT u.id, u.name, u.email, u.status, u.created_at,
                    u.vendor_verified, u.vendor_verified_at,
-                   spp.business_name, spp.description, spp.phone
+                   {$profileSelect}
             FROM users u
-            LEFT JOIN service_provider_profiles spp ON spp.user_id = u.id
+            {$profileJoin}
             WHERE {$where}
             ORDER BY u.created_at DESC
             LIMIT ? OFFSET ?

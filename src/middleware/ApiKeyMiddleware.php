@@ -74,6 +74,7 @@ class ApiKeyMiddleware {
             '/services',          // Public service listing/details
             '/categories',        // Public categories for browsing
             '/countries',         // Public country metadata
+            '/payments/webhooks', // Gateway webhooks are authenticated by signature, not API key
         ];
     }
     

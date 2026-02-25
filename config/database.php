@@ -11,7 +11,13 @@ class Database {
         $host = getenv('DB_HOST') ?: 'localhost';
         $dbname = getenv('DB_NAME') ?: 'abegeppme';
         $username = getenv('DB_USER') ?: 'root';
-        $password = getenv('DB_PASS') ?: '';
+        $password = getenv('DB_PASS');
+        if ($password === false || $password === '') {
+            $password = getenv('DB_PASSWORD');
+        }
+        if ($password === false) {
+            $password = '';
+        }
         $charset = 'utf8mb4';
         
         $dsn = "mysql:host={$host};dbname={$dbname};charset={$charset}";
@@ -24,6 +30,11 @@ class Database {
         
         try {
             $this->connection = new PDO($dsn, $username, $password, $options);
+
+            // Disable ONLY_FULL_GROUP_BY for this session
+            $this->connection->exec("SET SESSION sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))");
+
+
         } catch (PDOException $e) {
             throw new Exception("Database connection failed: " . $e->getMessage());
         }

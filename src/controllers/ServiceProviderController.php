@@ -1,662 +1,427 @@
 <?php
 /**
- * Service Provider Controller - Complete Implementation
+ * Service Provider (Vendor) Controller
  */
 
 require_once __DIR__ . '/BaseController.php';
 require_once __DIR__ . '/../middleware/AuthMiddleware.php';
-require_once __DIR__ . '/../payment/PaymentGatewayFactory.php';
-require_once __DIR__ . '/../utils/CountryManager.php';
 
 class ServiceProviderController extends BaseController {
     private $auth;
-    private $countryManager;
-    
+
     public function __construct() {
         parent::__construct();
         $this->auth = new AuthMiddleware();
-        $this->countryManager = new CountryManager();
+        $this->ensureProviderSupportTables();
         $this->ensureVerificationTables();
-        $this->seedDefaultVerificationRequirements();
     }
     
     public function index() {
         $pagination = $this->getPaginationParams();
-        $country_id = $_GET['country_id'] ?? null;
-        $category_id = $_GET['category_id'] ?? null;
         $search = $_GET['search'] ?? null;
-        $latitude = isset($_GET['latitude']) ? (float)$_GET['latitude'] : null;
-        $longitude = isset($_GET['longitude']) ? (float)$_GET['longitude'] : null;
-        $min_rating = isset($_GET['min_rating']) ? (float)$_GET['min_rating'] : null;
-        $sort_by = $_GET['sort_by'] ?? 'distance';
-        $verified = isset($_GET['verified']) ? (bool)$_GET['verified'] : null;
+        $country_id = $_GET['country_id'] ?? null;
+        $category = $_GET['category_id'] ?? null;
+        $verified = isset($_GET['verified']) ? strtolower((string)$_GET['verified']) === 'true' : null;
         
-        // Check if business_name and description columns exist
-        $hasBusinessName = $this->checkColumnExists('users', 'business_name');
-        $hasDescription = $this->checkColumnExists('users', 'description');
-        $hasVendorVerified = $this->checkColumnExists('users', 'vendor_verified');
-        
-        // Check if reviews table exists
-        $hasReviewsTable = $this->checkTableExists('reviews');
-        
-        // Check if country_id column exists
-        $hasCountryId = $this->checkColumnExists('users', 'country_id');
-        
-        // Check if store_image or business_image columns exist
-        $hasStoreImage = $this->checkColumnExists('users', 'store_image');
-        $hasBusinessImage = $this->checkColumnExists('users', 'business_image');
-        $hasLogo = $this->checkColumnExists('users', 'logo');
-        
-        // Base query with aggregations
-        $query = "
-            SELECT u.id, u.name, u.email, u.avatar, u.phone, u.created_at,
-                   " . ($hasCountryId ? "u.country_id," : "NULL as country_id,") . "
-                   " . ($hasVendorVerified ? "u.vendor_verified, u.vendor_verified_at," : "1 as vendor_verified, NULL as vendor_verified_at,") . "
-                   " . ($hasBusinessName ? "u.business_name," : "NULL as business_name,") . "
-                   " . ($hasDescription ? "u.description," : "NULL as description,") . "
-                   " . ($hasStoreImage ? "u.store_image," : "NULL as store_image,") . "
-                   " . ($hasBusinessImage ? "u.business_image," : "NULL as business_image,") . "
-                   " . ($hasLogo ? "u.logo," : "NULL as logo,") . "
-                   COUNT(DISTINCT s.id) as service_count";
-        
-        // Add reviews aggregation only if table exists
-        if ($hasReviewsTable) {
-            $query .= ",
-                   COALESCE(AVG(r.rating), 0) as average_rating,
-                   COUNT(DISTINCT r.id) as review_count";
-        } else {
-            $query .= ",
-                   0 as average_rating,
-                   0 as review_count";
-        }
-        
-        // Add distance calculation if location provided
-        if ($latitude !== null && $longitude !== null) {
-            // Note: This is a simplified distance calculation
-            // For production, consider using a proper geospatial function
-            $query .= ", (
-                6371 * acos(
-                    cos(radians(?)) * cos(radians(COALESCE(u.latitude, 0))) *
-                    cos(radians(COALESCE(u.longitude, 0)) - radians(?)) +
-                    sin(radians(?)) * sin(radians(COALESCE(u.latitude, 0)))
-                )
-            ) as distance";
-        }
-        
-        $query .= "
-            FROM users u
-            LEFT JOIN services s ON u.id = s.vendor_id AND s.status = 'ACTIVE'";
-        
-        // Join reviews only if table exists
-        if ($hasReviewsTable) {
-            $query .= "
-            LEFT JOIN reviews r ON u.id = r.vendor_id";
-        }
-        
-        // Join categories if filtering by category
-        if ($category_id) {
-            $query .= "
-                INNER JOIN service_provider_categories spc ON u.id = spc.vendor_id
-            ";
-        }
-        
-        // Check if is_vendor column exists, otherwise fall back to role
         $hasIsVendor = $this->checkColumnExists('users', 'is_vendor');
-        
-        if ($hasIsVendor) {
-            $query .= " WHERE u.is_vendor = 1 AND u.status = 'ACTIVE'";
-        } else {
-            $query .= " WHERE u.role = 'VENDOR' AND u.status = 'ACTIVE'";
-        }
+        $hasVendorVerified = $this->checkColumnExists('users', 'vendor_verified');
+        $hasProfiles = $this->checkTableExists('service_provider_profiles');
 
-        // Public market should only show verified providers by default.
-        if ($hasVendorVerified) {
-            if ($verified === null || $verified === true) {
-                $query .= " AND u.vendor_verified = 1";
-            } else {
-                $query .= " AND (u.vendor_verified = 0 OR u.vendor_verified IS NULL)";
-            }
-        }
+        $vendorWhere = $hasIsVendor
+            ? "(u.is_vendor = 1 OR u.role = 'VENDOR')"
+            : "u.role = 'VENDOR'";
+
+        $profileJoin = $hasProfiles ? "LEFT JOIN service_provider_profiles spp ON spp.user_id = u.id" : "";
+
+        $query = "
+            SELECT
+                   u.id, u.name, u.email, u.avatar, u.phone, u.role, u.created_at,
+                   " . ($hasVendorVerified ? "u.vendor_verified, u.vendor_verified_at," : "0 AS vendor_verified, NULL AS vendor_verified_at,") . "
+                   " . ($hasProfiles ? "spp.business_name, spp.description, spp.logo," : "NULL AS business_name, NULL AS description, NULL AS logo,") . "
+                   c.name as country_name, 
+                   (
+                     SELECT GROUP_CONCAT(DISTINCT s.category)
+                     FROM services s
+                     WHERE s.vendor_id = u.id AND s.status = 'ACTIVE'
+                   ) as categories,
+                   (
+                     SELECT COUNT(*)
+                     FROM services s2
+                     WHERE s2.vendor_id = u.id AND s2.status = 'ACTIVE'
+                   ) as service_count,
+                   (
+                     SELECT ROUND(AVG(r.rating), 2)
+                     FROM reviews r
+                     WHERE r.vendor_id = u.id
+                   ) as average_rating,
+                   (
+                     SELECT COUNT(*)
+                     FROM reviews r2
+                     WHERE r2.vendor_id = u.id
+                   ) as review_count
+            FROM users u
+            LEFT JOIN countries c ON BINARY c.id = BINARY CAST(u.country_id AS CHAR(2))
+            {$profileJoin}
+            WHERE {$vendorWhere}
+        ";
         
         $params = [];
         
-        // Add location params for distance calculation
-        if ($latitude !== null && $longitude !== null) {
-            $params[] = $latitude;
-            $params[] = $longitude;
-            $params[] = $latitude;
+        if ($search) {
+            $query .= " AND (u.name LIKE ? OR u.email LIKE ? " . ($hasProfiles ? " OR spp.business_name LIKE ?" : "") . ")";
+            $term = "%$search%";
+            $params[] = $term;
+            $params[] = $term;
+            if ($hasProfiles) {
+                $params[] = $term;
+            }
         }
-        
-        // Apply filters
-        if ($country_id && $hasCountryId) {
+
+        if ($country_id) {
             $query .= " AND u.country_id = ?";
             $params[] = $country_id;
         }
-        
-        if ($category_id) {
-            $query .= " AND spc.category_id = ?";
-            $params[] = $category_id;
+
+        if ($hasVendorVerified && $verified !== null) {
+            $query .= " AND u.vendor_verified = ?";
+            $params[] = $verified ? 1 : 0;
+        }
+
+        if ($category) {
+            $query .= " AND EXISTS (
+                SELECT 1 FROM services s3
+                WHERE s3.vendor_id = u.id
+                  AND s3.status = 'ACTIVE'
+                  AND s3.category = ?
+            )";
+            $params[] = $category;
         }
         
-        if ($search) {
-            $query .= " AND (u.name LIKE ? OR u.email LIKE ?";
-            $searchTerm = "%{$search}%";
-            $params[] = $searchTerm;
-            $params[] = $searchTerm;
-            
-            if ($hasBusinessName) {
-                $query .= " OR u.business_name LIKE ?";
-                $params[] = $searchTerm;
-            }
-            if ($hasDescription) {
-                $query .= " OR u.description LIKE ?";
-                $params[] = $searchTerm;
-            }
-            $query .= ")";
-        }
-        
-        $query .= " GROUP BY u.id";
-        
-        // Filter by minimum rating
-        if ($min_rating !== null) {
-            $query .= " HAVING average_rating >= ?";
-            $params[] = $min_rating;
-        }
-        
-        // Sorting
-        switch ($sort_by) {
-            case 'rating':
-                $query .= " ORDER BY average_rating DESC, review_count DESC";
-                break;
-            case 'reviews':
-                $query .= " ORDER BY review_count DESC, average_rating DESC";
-                break;
-            case 'name':
-                if ($hasBusinessName) {
-                    $query .= " ORDER BY COALESCE(u.business_name, u.name) ASC";
-                } else {
-                    $query .= " ORDER BY u.name ASC";
-                }
-                break;
-            case 'distance':
-            default:
-                if ($latitude !== null && $longitude !== null) {
-                    $query .= " ORDER BY distance ASC, average_rating DESC";
-                } else {
-                    $query .= " ORDER BY average_rating DESC, service_count DESC";
-                }
-                break;
-        }
-        
-        $query .= " LIMIT ? OFFSET ?";
+        $query .= " ORDER BY u.created_at DESC LIMIT ? OFFSET ?";
         $params[] = $pagination['limit'];
         $params[] = $pagination['offset'];
         
         $stmt = $this->db->prepare($query);
         $stmt->execute($params);
-        $providers = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $providers = $stmt->fetchAll();
         
-        // Get total count for pagination
-        $countQuery = "
-            SELECT COUNT(DISTINCT u.id) as total
-            FROM users u
-            LEFT JOIN services s ON u.id = s.vendor_id AND s.status = 'ACTIVE'";
-        
-        // Join reviews only if table exists
-        if ($hasReviewsTable) {
-            $countQuery .= "
-            LEFT JOIN reviews r ON u.id = r.vendor_id";
-        }
-        
-        if ($category_id) {
-            $countQuery .= " INNER JOIN service_provider_categories spc ON u.id = spc.vendor_id";
-        }
-        
-        if ($hasIsVendor) {
-            $countQuery .= " WHERE u.is_vendor = 1 AND u.status = 'ACTIVE'";
-        } else {
-            $countQuery .= " WHERE u.role = 'VENDOR' AND u.status = 'ACTIVE'";
-        }
-
-        if ($hasVendorVerified) {
-            if ($verified === null || $verified === true) {
-                $countQuery .= " AND u.vendor_verified = 1";
-            } else {
-                $countQuery .= " AND (u.vendor_verified = 0 OR u.vendor_verified IS NULL)";
-            }
-        }
-        $countParams = [];
-        
-        if ($country_id && $hasCountryId) {
-            $countQuery .= " AND u.country_id = ?";
-            $countParams[] = $country_id;
-        }
-        
-        if ($category_id) {
-            $countQuery .= " AND spc.category_id = ?";
-            $countParams[] = $category_id;
-        }
-        
+        // Get total count
+        $countQuery = "SELECT COUNT(*) as total FROM users u " . $profileJoin . " WHERE {$vendorWhere}";
         if ($search) {
-            $countQuery .= " AND (u.name LIKE ? OR u.email LIKE ?";
-            $searchTerm = "%{$search}%";
-            $countParams[] = $searchTerm;
-            $countParams[] = $searchTerm;
-            
-            if ($hasBusinessName) {
-                $countQuery .= " OR u.business_name LIKE ?";
-                $countParams[] = $searchTerm;
-            }
-            if ($hasDescription) {
-                $countQuery .= " OR u.description LIKE ?";
-                $countParams[] = $searchTerm;
-            }
-            $countQuery .= ")";
+            $countQuery .= " AND (u.name LIKE ? OR u.email LIKE ? " . ($hasProfiles ? " OR spp.business_name LIKE ?" : "") . ")";
+        }
+        if ($country_id) {
+            $countQuery .= " AND u.country_id = ?";
+        }
+        if ($hasVendorVerified && $verified !== null) {
+            $countQuery .= " AND u.vendor_verified = ?";
+        }
+        if ($category) {
+            $countQuery .= " AND EXISTS (
+                SELECT 1 FROM services s3
+                WHERE s3.vendor_id = u.id
+                  AND s3.status = 'ACTIVE'
+                  AND s3.category = ?
+            )";
         }
         
         $countStmt = $this->db->prepare($countQuery);
+        // Slice params to remove limit/offset
+        $countParams = array_slice($params, 0, count($params) - 2);
         $countStmt->execute($countParams);
-        $total = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
-        
-        // Get categories for each provider
-        foreach ($providers as &$provider) {
-            $catStmt = $this->db->prepare("
-                SELECT sc.id, sc.name, sc.slug, spc.is_primary
-                FROM service_provider_categories spc
-                INNER JOIN service_categories sc ON spc.category_id = sc.id
-                WHERE spc.vendor_id = ? AND sc.is_active = 1
-                ORDER BY spc.is_primary DESC, sc.name ASC
-            ");
-            $catStmt->execute([$provider['id']]);
-            $provider['categories'] = $catStmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            // Format numeric values
-            $provider['average_rating'] = (float)$provider['average_rating'];
-            $provider['service_count'] = (int)$provider['service_count'];
-            $provider['review_count'] = (int)$provider['review_count'];
-            if (isset($provider['distance'])) {
-                $provider['distance'] = (float)$provider['distance'];
-            }
-        }
+        $total = $countStmt->fetch()['total'];
         
         $this->sendResponse([
             'providers' => $providers,
             'pagination' => [
-                'current_page' => $pagination['page'],
-                'per_page' => $pagination['limit'],
-                'total' => (int)$total,
-                'total_pages' => (int)ceil($total / $pagination['limit']),
-            ]
+                'page' => $pagination['page'],
+                'limit' => $pagination['limit'],
+                'total' => $total,
+                'pages' => ceil($total / $pagination['limit']),
+            ],
         ]);
     }
     
     public function get($id) {
-        if ($id === 'register') {
-            $this->sendError('Use POST method', 405);
-        } elseif ($id === 'verification') {
-            $this->getMyVerificationData();
-        } elseif ($id === 'verification-requirements') {
+        if ($id === 'verification-requirements') {
             $this->getVerificationRequirements();
-        } else {
-            // Check if reviews table exists
-            $hasReviewsTable = $this->checkTableExists('reviews');
-            
-            // Check if is_vendor column exists
-            $hasIsVendor = $this->checkColumnExists('users', 'is_vendor');
-            $hasVendorVerified = $this->checkColumnExists('users', 'vendor_verified');
-            
-            // Check if country_id column exists
-            $hasCountryId = $this->checkColumnExists('users', 'country_id');
-            $hasCountriesTable = $this->checkTableExists('countries');
-            
-            // Check if store_image or business_image columns exist
-            $hasStoreImage = $this->checkColumnExists('users', 'store_image');
-            $hasBusinessImage = $this->checkColumnExists('users', 'business_image');
-            $hasLogo = $this->checkColumnExists('users', 'logo');
-            
-            // Get service provider by ID
-            $roleCondition = $hasIsVendor ? "u.is_vendor = 1" : "u.role = 'VENDOR'";
-            
-            $query = "
-                SELECT u.*, 
-                       " . (($hasCountryId && $hasCountriesTable) ? "c.name as country_name," : "NULL as country_name,") . "
-                       " . ($hasStoreImage ? "u.store_image," : "NULL as store_image,") . "
-                       " . ($hasBusinessImage ? "u.business_image," : "NULL as business_image,") . "
-                       " . ($hasLogo ? "u.logo," : "NULL as logo,") . "
-                       COUNT(DISTINCT s.id) as service_count";
-            
-            // Add reviews aggregation only if table exists
-            if ($hasReviewsTable) {
-                $query .= ",
-                       COALESCE(AVG(r.rating), 0) as average_rating,
-                       COUNT(DISTINCT r.id) as review_count";
-            } else {
-                $query .= ",
-                       0 as average_rating,
-                       0 as review_count";
-            }
-            
-            $query .= "
-                FROM users u";
-            
-            // Join countries only if country_id column exists
-            if ($hasCountryId && $hasCountriesTable) {
-                $query .= "
-                LEFT JOIN countries c ON u.country_id = c.id";
-            }
-            
-            $query .= "
-                LEFT JOIN services s ON u.id = s.vendor_id";
-            
-            // Join reviews only if table exists
-            if ($hasReviewsTable) {
-                $query .= "
-                LEFT JOIN reviews r ON u.id = r.vendor_id";
-            }
-            
-            $query .= "
-                WHERE u.id = ? AND {$roleCondition}
-                GROUP BY u.id
-            ";
-            if ($hasVendorVerified) {
-                $query = str_replace("GROUP BY u.id", "AND u.vendor_verified = 1 GROUP BY u.id", $query);
-            }
-            
-            $stmt = $this->db->prepare($query);
-            $stmt->execute([$id]);
-            $provider = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$provider) {
-                $this->sendError('Service provider not found', 404);
-            }
-            
-            // Get services
-            $servicesStmt = $this->db->prepare("
-                SELECT * FROM services 
-                WHERE vendor_id = ? AND status = 'ACTIVE'
-                ORDER BY featured DESC, created_at DESC
-            ");
-            $servicesStmt->execute([$id]);
-            $provider['services'] = $servicesStmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            // Get reviews only if table exists
-            if ($hasReviewsTable) {
-                $reviewsStmt = $this->db->prepare("
-                    SELECT r.*, u.name as customer_name, u.avatar as customer_avatar
-                    FROM reviews r
-                    INNER JOIN users u ON r.customer_id = u.id
-                    WHERE r.vendor_id = ?
-                    ORDER BY r.created_at DESC
-                    LIMIT 10
-                ");
-                $reviewsStmt->execute([$id]);
-                $provider['reviews'] = $reviewsStmt->fetchAll(PDO::FETCH_ASSOC);
-            } else {
-                $provider['reviews'] = [];
-            }
-            
-            unset($provider['password']);
-            $this->sendResponse($provider);
+            return;
         }
+
+        if ($id === 'verification') {
+            $this->getMyVerification();
+            return;
+        }
+
+        $this->getProviderProfile($id);
     }
-    
+
     public function create() {
         $data = $this->getRequestBody();
-        
-        if (isset($data['action']) && $data['action'] === 'register') {
-            $this->registerAsProvider($data);
-        } elseif (isset($data['action']) && $data['action'] === 'submit-verification') {
+        $action = $data['action'] ?? '';
+
+        if ($action === 'register') {
+            $this->registerProvider($data);
+            return;
+        }
+
+        if ($action === 'submit-verification') {
             $this->submitVerification($data);
-        } else {
-            $this->sendError('Invalid action. Use action: "register" or "submit-verification"', 400);
+            return;
         }
+
+        $this->sendError('Invalid action', 400);
     }
-    
-    private function registerAsProvider($data) {
-        $user = $this->auth->requireAuth();
-        
-        // Check if already a vendor
-        if ($user['role'] === 'VENDOR') {
-            $this->sendError('You are already registered as a service provider', 400);
-        }
-        
-        // Validate required fields
-        $businessName = $data['business_name'] ?? $user['name'];
-        $phone = $data['phone'] ?? null;
-        $countryId = $data['country_id'] ?? $user['country_id'] ?? 'NG';
-        
-        // Update user role to VENDOR
-        $updateStmt = $this->db->prepare("
-            UPDATE users 
-            SET role = 'VENDOR', 
-                phone = COALESCE(?, phone),
-                country_id = COALESCE(?, country_id),
-                status = 'PENDING_VERIFICATION'
-            WHERE id = ?
+
+    private function getProviderProfile(string $id) {
+        $hasProfiles = $this->checkTableExists('service_provider_profiles');
+        $hasVendorVerified = $this->checkColumnExists('users', 'vendor_verified');
+
+        $profileJoin = $hasProfiles ? "LEFT JOIN service_provider_profiles spp ON spp.user_id = u.id" : "";
+
+        $stmt = $this->db->prepare("
+            SELECT
+                u.id, u.name, u.email, u.phone, u.avatar, u.country_id, u.created_at,
+                " . ($hasProfiles ? "spp.business_name, spp.description, spp.logo," : "NULL AS business_name, NULL AS description, NULL AS logo,") . "
+                " . ($hasVendorVerified ? "u.vendor_verified, u.vendor_verified_at," : "0 AS vendor_verified, NULL AS vendor_verified_at,") . "
+                ROUND(COALESCE((SELECT AVG(r.rating) FROM reviews r WHERE r.vendor_id = u.id), 0), 2) AS average_rating,
+                COALESCE((SELECT COUNT(*) FROM reviews r2 WHERE r2.vendor_id = u.id), 0) AS review_count
+            FROM users u
+            {$profileJoin}
+            WHERE u.id = ?
+            LIMIT 1
         ");
-        $updateStmt->execute([$phone, $countryId, $user['id']]);
-        
-        // Create subaccount (if bank details provided)
-        if (!empty($data['bank_account_number']) && !empty($data['bank_code'])) {
-            $this->createSubaccount($user['id'], $data, $countryId);
+        $stmt->execute([$id]);
+        $provider = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$provider) {
+            $this->sendError('Service provider not found', 404);
         }
-        
-        // Get updated user
-        $getStmt = $this->db->prepare("SELECT * FROM users WHERE id = ?");
-        $getStmt->execute([$user['id']]);
-        $updated = $getStmt->fetch();
-        unset($updated['password']);
-        
-        $this->sendResponse([
-            'message' => 'Successfully registered as service provider. Verification pending.',
-            'user' => $updated,
-        ], 201);
+
+        $servicesStmt = $this->db->prepare("
+            SELECT
+                s.id, s.vendor_id, s.title, s.description, s.price, s.category,
+                s.images, s.gallery, s.status, s.featured, s.rating, s.review_count, s.created_at
+            FROM services s
+            WHERE s.vendor_id = ? AND s.status = 'ACTIVE'
+            ORDER BY s.created_at DESC
+        ");
+        $servicesStmt->execute([$id]);
+        $services = $servicesStmt->fetchAll(PDO::FETCH_ASSOC);
+        $services = array_map(function ($service) {
+            $service['images'] = !empty($service['images']) ? (json_decode($service['images'], true) ?: []) : [];
+            $service['gallery'] = !empty($service['gallery']) ? (json_decode($service['gallery'], true) ?: []) : [];
+            return $service;
+        }, $services);
+
+        $reviewsStmt = $this->db->prepare("
+            SELECT
+                r.id, r.order_id, r.customer_id, r.vendor_id, r.service_id, r.rating, r.comment, r.images, r.status, r.created_at,
+                u.name AS customer_name, u.avatar AS customer_avatar
+            FROM reviews r
+            INNER JOIN users u ON r.customer_id = u.id
+            WHERE r.vendor_id = ? AND r.status IN ('APPROVED', 'PENDING')
+            ORDER BY r.created_at DESC
+        ");
+        $reviewsStmt->execute([$id]);
+        $reviews = $reviewsStmt->fetchAll(PDO::FETCH_ASSOC);
+        $reviews = array_map(function ($review) {
+            $review['images'] = !empty($review['images']) ? (json_decode($review['images'], true) ?: []) : [];
+            return $review;
+        }, $reviews);
+
+        $provider['business_name'] = $provider['business_name'] ?: $provider['name'];
+        $provider['description'] = $provider['description'] ?: '';
+        $provider['services'] = $services;
+        $provider['reviews'] = $reviews;
+        $provider['service_count'] = count($services);
+
+        $this->sendResponse($provider);
     }
-    
-    private function createSubaccount(string $userId, array $data, string $countryId) {
-        // Get country and payment gateway
-        $country = $this->countryManager->getCountry($countryId);
-        if (!$country || !$country['payment_gateway']) {
-            return; // No payment gateway configured
-        }
-        
-        try {
-            $config = json_decode($country['payment_gateway_config'], true);
-            $gateway = PaymentGatewayFactory::create($country['payment_gateway'], $config);
-            
-            // Create transfer recipient
-            $recipient = $gateway->createRecipient([
-                'account_number' => $data['bank_account_number'],
-                'bank_code' => $data['bank_code'],
-                'account_name' => $data['account_name'] ?? $data['business_name'],
-                'currency' => $country['currency_code'],
-            ]);
-            
-            // Save subaccount
-            $subaccountId = $this->generateUUID();
-            $insertStmt = $this->db->prepare("
-                INSERT INTO subaccounts (
-                    id, user_id, country_id, subaccount_code, 
-                    account_number, account_name, bank_code, bank_name,
-                    transfer_recipient, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-                ON DUPLICATE KEY UPDATE
-                    subaccount_code = VALUES(subaccount_code),
-                    account_number = VALUES(account_number),
-                    account_name = VALUES(account_name),
-                    bank_code = VALUES(bank_code),
-                    bank_name = VALUES(bank_name),
-                    transfer_recipient = VALUES(transfer_recipient)
+
+    private function registerProvider(array $data) {
+        $user = $this->auth->requireAuth();
+
+        if ($this->checkColumnExists('users', 'is_vendor')) {
+            $stmt = $this->db->prepare("
+                UPDATE users
+                SET is_vendor = 1,
+                    status = CASE WHEN status = 'PENDING_VERIFICATION' THEN 'ACTIVE' ELSE status END
+                WHERE id = ?
             ");
-            
+            $stmt->execute([$user['id']]);
+        } else {
+            $stmt = $this->db->prepare("UPDATE users SET role = 'VENDOR' WHERE id = ?");
+            $stmt->execute([$user['id']]);
+        }
+
+        $businessNameProvided = array_key_exists('business_name', $data);
+        $descriptionProvided = array_key_exists('description', $data);
+        $phoneProvided = array_key_exists('phone', $data);
+        $logoProvided = array_key_exists('logo', $data);
+
+        $businessName = $businessNameProvided ? trim((string)$data['business_name']) : '';
+        $description = $descriptionProvided ? trim((string)$data['description']) : '';
+        $phone = $phoneProvided ? trim((string)$data['phone']) : '';
+        $logo = $logoProvided ? trim((string)$data['logo']) : '';
+
+        if ($businessName === '') {
+            $businessName = $user['name'] ?? $user['email'] ?? 'Service Provider';
+        }
+
+        $existsStmt = $this->db->prepare("
+            SELECT id, business_name, description, phone, logo
+            FROM service_provider_profiles
+            WHERE user_id = ?
+            LIMIT 1
+        ");
+        $existsStmt->execute([$user['id']]);
+        $existing = $existsStmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($existing) {
+            if (!$businessNameProvided) {
+                $businessName = $existing['business_name'] ?: ($user['name'] ?? $user['email'] ?? 'Service Provider');
+            }
+            if (!$descriptionProvided) {
+                $description = $existing['description'] ?? '';
+            }
+            if (!$phoneProvided) {
+                $phone = $existing['phone'] ?? '';
+            }
+            if (!$logoProvided) {
+                $logo = $existing['logo'] ?? '';
+            }
+
+            $updateStmt = $this->db->prepare("
+                UPDATE service_provider_profiles
+                SET business_name = ?, description = ?, phone = ?, logo = ?, updated_at = NOW()
+                WHERE id = ?
+            ");
+            $updateStmt->execute([$businessName, $description, $phone, $logo, $existing['id']]);
+        } else {
+            $insertStmt = $this->db->prepare("
+                INSERT INTO service_provider_profiles (id, user_id, business_name, description, phone, logo, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
+            ");
             $insertStmt->execute([
-                $subaccountId,
-                $userId,
-                $countryId,
-                $recipient['recipient_code'] ?? '',
-                $data['bank_account_number'],
-                $data['account_name'] ?? $data['business_name'],
-                $data['bank_code'],
-                $data['bank_name'] ?? null,
-                $recipient['recipient_code'] ?? null,
+                $this->generateUUID(),
+                $user['id'],
+                $businessName,
+                $description,
+                $phone,
+                $logo
             ]);
-        } catch (Exception $e) {
-            // Log error but don't fail registration
-            error_log("Subaccount creation failed: " . $e->getMessage());
         }
-    }
-    
-    public function getServices($provider_id) {
-        $pagination = $this->getPaginationParams();
-        $status = $_GET['status'] ?? 'ACTIVE';
-        
-        $query = "
-            SELECT * FROM services 
-            WHERE vendor_id = ?
-        ";
-        
-        $params = [$provider_id];
-        
-        if ($status) {
-            $query .= " AND status = ?";
-            $params[] = $status;
-        }
-        
-        $query .= " ORDER BY featured DESC, created_at DESC LIMIT ? OFFSET ?";
-        $params[] = $pagination['limit'];
-        $params[] = $pagination['offset'];
-        
-        $stmt = $this->db->prepare($query);
-        $stmt->execute($params);
-        $services = $stmt->fetchAll();
-        
-        $this->sendResponse($services);
+
+        $this->sendResponse([
+            'message' => 'Service provider profile saved successfully',
+            'user_id' => $user['id']
+        ]);
     }
 
     private function getVerificationRequirements() {
         $countryId = strtoupper($_GET['country_id'] ?? 'NG');
+
         $stmt = $this->db->prepare("
-            SELECT id, country_id, field_key, field_label, field_type, is_required, sort_order, options_json
+            SELECT country_id, field_key, field_label, field_type, is_required, sort_order, options_json
             FROM provider_verification_requirements
             WHERE country_id = ?
-            ORDER BY sort_order ASC
+            ORDER BY sort_order ASC, field_label ASC
         ");
         $stmt->execute([$countryId]);
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        $requirements = array_map(function ($row) {
-            return [
-                'id' => $row['id'],
-                'country_id' => $row['country_id'],
-                'field_key' => $row['field_key'],
-                'field_label' => $row['field_label'],
-                'field_type' => $row['field_type'],
-                'is_required' => intval($row['is_required']) === 1,
-                'sort_order' => intval($row['sort_order']),
-                'options' => json_decode($row['options_json'] ?? '[]', true) ?: [],
-            ];
+        $rows = array_map(function ($row) {
+            $row['is_required'] = (int)($row['is_required'] ?? 0) === 1;
+            $row['options'] = !empty($row['options_json']) ? (json_decode($row['options_json'], true) ?: null) : null;
+            unset($row['options_json']);
+            return $row;
         }, $rows);
-        $this->sendResponse($requirements);
+
+        $this->sendResponse($rows);
     }
 
-    private function getMyVerificationData() {
+    private function getMyVerification() {
         $user = $this->auth->requireAuth();
         $countryId = strtoupper($_GET['country_id'] ?? ($user['country_id'] ?? 'NG'));
-        $requirements = $this->fetchRequirements($countryId);
 
         $stmt = $this->db->prepare("
-            SELECT *
+            SELECT id, user_id, country_id, payload_json, status, rejection_reason, reviewed_by, reviewed_at, created_at, updated_at
             FROM provider_verification_submissions
             WHERE user_id = ? AND country_id = ?
-            ORDER BY updated_at DESC
             LIMIT 1
         ");
         $stmt->execute([$user['id'], $countryId]);
-        $submission = $stmt->fetch(PDO::FETCH_ASSOC);
-        if ($submission) {
-            $submission['payload'] = json_decode($submission['payload_json'] ?? '{}', true) ?: [];
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$row) {
+            $this->sendResponse(null);
         }
 
-        $this->sendResponse([
-            'country_id' => $countryId,
-            'requirements' => $requirements,
-            'submission' => $submission ?: null,
-        ]);
+        $row['payload'] = json_decode($row['payload_json'] ?? '{}', true) ?: [];
+        unset($row['payload_json']);
+        $this->sendResponse($row);
     }
 
     private function submitVerification(array $data) {
         $user = $this->auth->requireAuth();
         $countryId = strtoupper($data['country_id'] ?? ($user['country_id'] ?? 'NG'));
         $payload = $data['payload'] ?? null;
-        if (!is_array($payload)) {
+
+        if (!is_array($payload) || empty($payload)) {
             $this->sendError('payload object is required', 400);
         }
 
-        $requirements = $this->fetchRequirements($countryId);
-        foreach ($requirements as $req) {
-            if (!empty($req['is_required'])) {
-                $value = $payload[$req['field_key']] ?? null;
-                if ($value === null || $value === '') {
-                    $this->sendError("{$req['field_label']} is required", 400);
-                }
-            }
-        }
-
-        $existingStmt = $this->db->prepare("
-            SELECT id FROM provider_verification_submissions
+        $existsStmt = $this->db->prepare("
+            SELECT id
+            FROM provider_verification_submissions
             WHERE user_id = ? AND country_id = ?
             LIMIT 1
         ");
-        $existingStmt->execute([$user['id'], $countryId]);
-        $existing = $existingStmt->fetch(PDO::FETCH_ASSOC);
+        $existsStmt->execute([$user['id'], $countryId]);
+        $existing = $existsStmt->fetch(PDO::FETCH_ASSOC);
 
         if ($existing) {
-            $stmt = $this->db->prepare("
+            $updateStmt = $this->db->prepare("
                 UPDATE provider_verification_submissions
                 SET payload_json = ?, status = 'PENDING', rejection_reason = NULL, reviewed_by = NULL, reviewed_at = NULL, updated_at = NOW()
                 WHERE id = ?
             ");
-            $stmt->execute([json_encode($payload), $existing['id']]);
+            $updateStmt->execute([json_encode($payload), $existing['id']]);
             $submissionId = $existing['id'];
         } else {
             $submissionId = $this->generateUUID();
-            $stmt = $this->db->prepare("
-                INSERT INTO provider_verification_submissions (
-                    id, user_id, country_id, payload_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'PENDING', NOW(), NOW())
+            $insertStmt = $this->db->prepare("
+                INSERT INTO provider_verification_submissions (id, user_id, country_id, payload_json, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'PENDING', NOW(), NOW())
             ");
-            $stmt->execute([$submissionId, $user['id'], $countryId, json_encode($payload)]);
-        }
-
-        if ($this->checkColumnExists('users', 'vendor_verified')) {
-            $resetStmt = $this->db->prepare("UPDATE users SET vendor_verified = 0, vendor_verified_at = NULL WHERE id = ?");
-            $resetStmt->execute([$user['id']]);
+            $insertStmt->execute([$submissionId, $user['id'], $countryId, json_encode($payload)]);
         }
 
         $this->sendResponse([
-            'message' => 'Verification data submitted successfully. Awaiting admin review.',
+            'message' => 'Verification submitted successfully',
             'submission_id' => $submissionId,
+            'status' => 'PENDING'
         ]);
     }
 
-    private function fetchRequirements(string $countryId): array {
-        $stmt = $this->db->prepare("
-            SELECT field_key, field_label, field_type, is_required, sort_order, options_json
-            FROM provider_verification_requirements
-            WHERE country_id = ?
-            ORDER BY sort_order ASC
+    private function ensureProviderSupportTables() {
+        $this->db->exec("
+            CREATE TABLE IF NOT EXISTS service_provider_profiles (
+                id CHAR(36) NOT NULL PRIMARY KEY,
+                user_id CHAR(36) NOT NULL UNIQUE,
+                business_name VARCHAR(255) NULL,
+                description TEXT NULL,
+                phone VARCHAR(30) NULL,
+                logo VARCHAR(500) NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_spp_user_id (user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         ");
-        $stmt->execute([$countryId]);
-        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        return array_map(function ($row) {
-            return [
-                'field_key' => $row['field_key'],
-                'field_label' => $row['field_label'],
-                'field_type' => $row['field_type'],
-                'is_required' => intval($row['is_required']) === 1,
-                'sort_order' => intval($row['sort_order']),
-                'options' => json_decode($row['options_json'] ?? '[]', true) ?: [],
-            ];
-        }, $rows);
+
+        if (!$this->checkColumnExists('service_provider_profiles', 'logo')) {
+            $this->db->exec("ALTER TABLE service_provider_profiles ADD COLUMN logo VARCHAR(500) NULL AFTER phone");
+        }
     }
 
     private function ensureVerificationTables() {
@@ -692,34 +457,35 @@ class ServiceProviderController extends BaseController {
                 INDEX idx_verification_submission_status (status)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         ");
-    }
 
-    private function seedDefaultVerificationRequirements() {
-        $defaults = [
-            ['country' => 'NG', 'key' => 'nin_number', 'label' => 'NIN Number', 'type' => 'text', 'required' => 1, 'sort' => 10],
-            ['country' => 'NG', 'key' => 'nin_slip_url', 'label' => 'NIN Slip (Image/Document URL)', 'type' => 'document', 'required' => 1, 'sort' => 20],
-            ['country' => 'NG', 'key' => 'cac_certificate_url', 'label' => 'CAC Certificate (Image/Document URL)', 'type' => 'document', 'required' => 1, 'sort' => 30],
-            ['country' => 'NG', 'key' => 'cac_number', 'label' => 'CAC Number', 'type' => 'text', 'required' => 1, 'sort' => 40],
-            ['country' => 'NG', 'key' => 'utility_bill_url', 'label' => 'Utility Bill (Image/Document URL)', 'type' => 'document', 'required' => 1, 'sort' => 50],
-            ['country' => 'NG', 'key' => 'passport_photo_url', 'label' => 'Passport Photograph (Image URL)', 'type' => 'image', 'required' => 1, 'sort' => 60],
+        // Seed Nigeria defaults once.
+        $seed = [
+            ['nin_number', 'NIN Number', 'text', 1, 10],
+            ['nin_slip', 'NIN Slip', 'document', 1, 20],
+            ['cac_certificate', 'CAC Certificate', 'document', 1, 30],
+            ['cac_number', 'CAC Number', 'text', 1, 40],
+            ['utility_bill', 'Utility Bill', 'document', 1, 50],
+            ['passport_photo', 'Passport Photograph', 'image', 1, 60],
         ];
-
         $stmt = $this->db->prepare("
-            INSERT IGNORE INTO provider_verification_requirements (
-                id, country_id, field_key, field_label, field_type, is_required, sort_order, options_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+            INSERT INTO provider_verification_requirements
+            (id, country_id, field_key, field_label, field_type, is_required, sort_order, created_at, updated_at)
+            VALUES (?, 'NG', ?, ?, ?, ?, ?, NOW(), NOW())
+            ON DUPLICATE KEY UPDATE
+                field_label = VALUES(field_label),
+                field_type = VALUES(field_type),
+                is_required = VALUES(is_required),
+                sort_order = VALUES(sort_order),
+                updated_at = NOW()
         ");
-
-        foreach ($defaults as $row) {
+        foreach ($seed as $item) {
             $stmt->execute([
                 $this->generateUUID(),
-                $row['country'],
-                $row['key'],
-                $row['label'],
-                $row['type'],
-                $row['required'],
-                $row['sort'],
-                json_encode([]),
+                $item[0],
+                $item[1],
+                $item[2],
+                $item[3],
+                $item[4],
             ]);
         }
     }

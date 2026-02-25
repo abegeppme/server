@@ -29,15 +29,15 @@ class ServiceController extends BaseController {
                    c.name as country_name, cur.symbol as currency_symbol
             FROM services s
             INNER JOIN users u ON s.vendor_id = u.id
-            INNER JOIN countries c ON s.country_id = c.id
-            INNER JOIN currencies cur ON s.currency_code = cur.code
+            LEFT JOIN countries c ON BINARY c.id = BINARY CAST(u.country_id AS CHAR(2))
+            LEFT JOIN currencies cur ON c.currency_code = cur.code
             WHERE 1=1
         ";
         
         $params = [];
         
         if ($country_id) {
-            $query .= " AND s.country_id = ?";
+            $query .= " AND u.country_id = ?";
             $params[] = $country_id;
         }
         
@@ -89,8 +89,8 @@ class ServiceController extends BaseController {
                    c.name as country_name, cur.symbol as currency_symbol
             FROM services s
             INNER JOIN users u ON s.vendor_id = u.id
-            INNER JOIN countries c ON s.country_id = c.id
-            INNER JOIN currencies cur ON s.currency_code = cur.code
+            LEFT JOIN countries c ON BINARY c.id = BINARY CAST(u.country_id AS CHAR(2))
+            LEFT JOIN currencies cur ON c.currency_code = cur.code
             WHERE s.id = ?
         ");
         $stmt->execute([$id]);
@@ -153,9 +153,18 @@ class ServiceController extends BaseController {
         $serviceId = $this->generateUUID();
         
         // Build dynamic INSERT based on what fields are provided
-        $columns = ['id', 'vendor_id', 'country_id', 'title', 'status'];
-        $placeholders = ['?', '?', '?', '?', '?'];
-        $values = [$serviceId, $user['id'], $country_id, $title, $data['status'] ?? 'DRAFT'];
+        // Check if country_id column exists in services table before trying to insert
+        $hasCountryCol = $this->checkColumnExists('services', 'country_id');
+
+        $columns = ['id', 'vendor_id', 'title', 'status'];
+        $placeholders = ['?', '?', '?', '?'];
+        $values = [$serviceId, $user['id'], $title, $data['status'] ?? 'DRAFT'];
+
+        if ($hasCountryCol) {
+            $columns[] = 'country_id';
+            $placeholders[] = '?';
+            $values[] = $country_id;
+        }
         
         // Optional fields
         if (isset($data['city_id'])) {

@@ -56,6 +56,11 @@ class PaymentController extends BaseController {
             return;
         }
 
+        if ($method === 'POST' && $id === 'webhooks' && !empty($sub_resource)) {
+            $this->postWebhooks($sub_resource);
+            return;
+        }
+
         parent::handleRequest($method, $id, $sub_resource);
     }
     

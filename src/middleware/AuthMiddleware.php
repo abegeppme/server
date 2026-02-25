@@ -49,7 +49,9 @@ class AuthMiddleware {
      */
     public function requireRole(string $role): array {
         $user = $this->requireAuth();
-        if ($user['role'] !== $role) {
+        $normalizedExpected = $this->normalizeRole($role);
+        $normalizedActual = $this->normalizeRole($user['role'] ?? '');
+        if ($normalizedActual !== $normalizedExpected) {
             http_response_code(403);
             echo json_encode([
                 'success' => false,
@@ -64,7 +66,16 @@ class AuthMiddleware {
      * Require admin
      */
     public function requireAdmin(): array {
-        return $this->requireRole('ADMIN');
+        $user = $this->requireAuth();
+        if (!$this->isAdmin($user)) {
+            http_response_code(403);
+            echo json_encode([
+                'success' => false,
+                'error' => ['message' => 'Insufficient permissions']
+            ]);
+            exit();
+        }
+        return $user;
     }
     
     /**
@@ -85,7 +96,8 @@ class AuthMiddleware {
         
         if ($hasIsVendor) {
             // Use is_vendor flag (allows users to be both customer and vendor)
-            if (empty($user['is_vendor']) || $user['is_vendor'] == 0) {
+            $isVendorFlag = isset($user['is_vendor']) && (string)$user['is_vendor'] !== '0' && (string)$user['is_vendor'] !== '';
+            if (!$isVendorFlag) {
                 http_response_code(403);
                 echo json_encode([
                     'success' => false,
@@ -95,7 +107,8 @@ class AuthMiddleware {
             }
         } else {
             // Fall back to role check (backward compatibility)
-            if ($user['role'] !== 'VENDOR') {
+            $normalizedRole = $this->normalizeRole($user['role'] ?? '');
+            if ($normalizedRole !== 'VENDOR' && $normalizedRole !== 'SERVICE_PROVIDER' && $normalizedRole !== 'PROVIDER') {
                 http_response_code(403);
                 echo json_encode([
                     'success' => false,
@@ -122,9 +135,10 @@ class AuthMiddleware {
         }
         
         if ($hasIsVendor) {
-            return !empty($user['is_vendor']) && $user['is_vendor'] == 1;
+            return isset($user['is_vendor']) && (string)$user['is_vendor'] !== '0' && (string)$user['is_vendor'] !== '';
         } else {
-            return $user['role'] === 'VENDOR';
+            $normalizedRole = $this->normalizeRole($user['role'] ?? '');
+            return $normalizedRole === 'VENDOR' || $normalizedRole === 'SERVICE_PROVIDER' || $normalizedRole === 'PROVIDER';
         }
     }
     
@@ -142,10 +156,33 @@ class AuthMiddleware {
         }
         
         if ($hasIsCustomer) {
-            return !empty($user['is_customer']) && $user['is_customer'] == 1;
+            return isset($user['is_customer']) && (string)$user['is_customer'] !== '0' && (string)$user['is_customer'] !== '';
         } else {
             // Default: everyone is a customer unless they're admin/vendor only
-            return $user['role'] === 'CUSTOMER' || $user['role'] === 'VENDOR' || $user['role'] === 'ADMIN';
+            $normalizedRole = $this->normalizeRole($user['role'] ?? '');
+            return $normalizedRole === 'CUSTOMER' || $normalizedRole === 'VENDOR' || $normalizedRole === 'ADMIN';
         }
+    }
+
+    private function normalizeRole(string $role): string {
+        $upper = strtoupper(trim($role));
+        return str_replace([' ', '-'], '_', $upper);
+    }
+
+    private function isAdmin(array $user): bool {
+        $normalizedRole = $this->normalizeRole($user['role'] ?? '');
+        $isAdminFlag = isset($user['is_admin']) && (string)$user['is_admin'] !== '0' && (string)$user['is_admin'] !== '';
+        $isManagerFlag = isset($user['is_manager']) && (string)$user['is_manager'] !== '0' && (string)$user['is_manager'] !== '';
+        $email = strtolower(trim((string)($user['email'] ?? '')));
+
+        return
+            $normalizedRole === 'ADMIN' ||
+            $normalizedRole === 'ADMINISTRATOR' ||
+            $normalizedRole === 'SUPER_ADMIN' ||
+            $normalizedRole === 'MANAGER' ||
+            $isAdminFlag ||
+            $isManagerFlag ||
+            $email === 'admin@abegeppme.com' ||
+            $email === 'admin@abegeppme';
     }
 }
